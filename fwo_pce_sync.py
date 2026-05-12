@@ -50,7 +50,9 @@ PCE_AR_PREFIX = "WL-"                 # label value prefix: WL-172.24.50.165
 # PCE label keys to create FWO object groups for
 GROUP_LABEL_KEYS = ["role", "env", "app", "bu", "loc"]
 
-RS_PREFIX     = "FWO_"               # prefix for PCE rulesets created by this script
+RS_PREFIX        = "FWO_"            # prefix for PCE rulesets (legacy direct-rule export)
+SYNC_RS_TAG      = "[fwo-sync]"     # description marker — identifies modelling-sync rulesets
+FWO_ALL_WORKLOADS = "ALL_WORKLOADS" # reserved App Role name → PCE "all workloads" (ams)
 
 VERIFY_SSL    = False
 requests.packages.urllib3.disable_warnings()
@@ -738,7 +740,7 @@ def sync_export(token, dry_run):
     pce_provision(dry_run)
 
 
-MODELLING_PREFIX = RS_PREFIX + "MODELLING_"
+MODELLING_PREFIX     = RS_PREFIX + "MODELLING_"  # legacy prefix (migrated away on first run)
 
 # Matches <ENV>-<APP>-<ROLE>  e.g.  PR-WEBAPP-WEB  DR-DB-DATA
 ROLE_NAME_RE = re.compile(r'^([A-Z0-9]+)-([A-Z0-9]+)-([A-Z0-9]+)$')
@@ -974,6 +976,18 @@ def sync_export_modelling(token, dry_run):
     rs_by_name = {rs["name"]: rs for rs in existing_rs}
     pce_groups_by_name = {g["name"]: g for g in existing_pce_groups}
 
+    # PCE "Any (0.0.0.0/0)" IP list — used when FWO nwobject IP is 0.0.0.0
+    pce_ip_lists = pce_get(f"/orgs/{PCE_ORG}/sec_policy/draft/ip_lists", {"max_results": 500})
+    any_ip_list_href = next(
+        (il["href"] for il in pce_ip_lists
+         if any(r.get("from_ip") == "0.0.0.0" for r in il.get("ip_ranges", []))),
+        None
+    )
+    if any_ip_list_href:
+        log.info(f"  Any IP list: {any_ip_list_href.split('/')[-1]}")
+    else:
+        log.warning("  No 'Any (0.0.0.0/0)' IP list found in PCE — 0.0.0.0 nwobjects will be skipped")
+
     # PCE named services — build lookup by name and by port+proto
     pce_services_raw = pce_get(f"/orgs/{PCE_ORG}/sec_policy/draft/services", {"max_results": 500})
     pce_svc_by_name = {s["name"].lower(): s for s in pce_services_raw}
@@ -1011,12 +1025,17 @@ def sync_export_modelling(token, dry_run):
     def _actors_with_env(nwobjects, approles):
         """Return (actors_without_env, env_segment_or_None).
         Named roles (<ENV>-<APP>-<ROLE>) → [app_label, role_label] actors, env returned separately.
-        The caller decides whether env goes into scope or into actors.
-        Other roles → ar-label-group actor (backward compat)."""
+        ALL_WORKLOADS → {"actors": "ams"}.
+        Other roles → ar-label-group actor (backward compat).
+        nwobject 0.0.0.0 → PCE Any IP list; other IPs → logged and skipped."""
         actors = []
         env_seg = None
         for entry in approles:
             grp_name = entry["nwgroup"]["name"]
+            if grp_name == FWO_ALL_WORKLOADS:
+                actors.append({"actors": "ams"})
+                log.info(f"    '{grp_name}' → all workloads (ams)")
+                continue
             parsed = parse_role_name(grp_name)
             if parsed:
                 env, app, role = parsed
@@ -1032,7 +1051,14 @@ def sync_export_modelling(token, dry_run):
                 log.warning(f"    PCE label group '{grp_name}' not found — skipped")
         for entry in nwobjects:
             ip = str(entry["owner_network"]["ip"]).split("/")[0]
-            actors.append({"actors": ip})
+            if ip == "0.0.0.0":
+                if any_ip_list_href:
+                    actors.append({"ip_list": {"href": any_ip_list_href}})
+                    log.info(f"    0.0.0.0 nwobject → PCE Any IP list")
+                else:
+                    log.warning(f"    0.0.0.0 nwobject skipped — no Any IP list in PCE")
+            else:
+                log.warning(f"    IP nwobject {ip} skipped — use App Roles for workload actors")
         return actors or [{"actors": "ams"}], env_seg
 
     def _ingress(svc_connections):
@@ -1055,23 +1081,40 @@ def sync_export_modelling(token, dry_run):
 
     provisioned = False
 
-    # Soft-deleted connections (removed=true)
-    for conn in removed:
-        rs_name = MODELLING_PREFIX + (conn["name"] or f"conn_{conn['id']}")
-        if rs_name in rs_by_name:
-            _pce_delete_ruleset(rs_by_name[rs_name]["href"], rs_name, dry_run)
+    # Derive clean ruleset name from connection name (no prefix)
+    def _rs_name(conn):
+        return conn["name"] or f"conn_{conn['id']}"
+
+    # ── Migration: remove ALL legacy FWO_MODELLING_* rulesets ────────────────
+    # They are replaced by clean-named rulesets with SYNC_RS_TAG in description.
+    expected_clean_names = {_rs_name(c) for c in active}
+    for rs_name, rs in list(rs_by_name.items()):
+        if rs_name.startswith(MODELLING_PREFIX):
+            clean = rs_name[len(MODELLING_PREFIX):]
+            action = f"→ '{clean}'" if clean in expected_clean_names else "(orphan)"
+            log.info(f"  Migrating legacy '{rs_name}' {action}")
+            _pce_delete_ruleset(rs["href"], rs_name, dry_run)
             provisioned = True
 
-    # Reconcile: delete PCE rulesets with FWO_MODELLING_ prefix that no longer exist in FWO
-    expected_rs_names = {MODELLING_PREFIX + (c["name"] or f"conn_{c['id']}") for c in active}
+    # Soft-deleted connections → delete by description tag or legacy name
+    for conn in removed:
+        name = _rs_name(conn)
+        legacy = MODELLING_PREFIX + name
+        for candidate in (name, legacy):
+            if candidate in rs_by_name:
+                _pce_delete_ruleset(rs_by_name[candidate]["href"], candidate, dry_run)
+                provisioned = True
+
+    # Reconcile: delete sync-tagged rulesets no longer in FWO
     for rs_name, rs in rs_by_name.items():
-        if rs_name.startswith(MODELLING_PREFIX) and rs_name not in expected_rs_names:
+        desc = rs.get("description", "")
+        if desc.startswith(SYNC_RS_TAG) and rs_name not in expected_clean_names:
             _pce_delete_ruleset(rs["href"], rs_name, dry_run)
             provisioned = True
 
     # Upsert active connections
     for conn in active:
-        rs_name = MODELLING_PREFIX + (conn["name"] or f"conn_{conn['id']}")
+        rs_name = _rs_name(conn)
         consumers, src_env = _actors_with_env(conn["source_nwobjects"], conn["source_approles"])
         providers, dst_env = _actors_with_env(conn["dest_nwobjects"],   conn["dest_approles"])
         ingress   = _ingress(conn["service_connections"])
@@ -1097,7 +1140,7 @@ def sync_export_modelling(token, dry_run):
         rs_body = {
             "name":        rs_name,
             "enabled":     True,
-            "description": conn.get("reason") or "Created by FWO Modelling sync",
+            "description": f"{SYNC_RS_TAG} {conn.get('reason') or ''}".strip(),
             "scopes":      scopes,
             "rules": [{
                 "enabled":            True,
