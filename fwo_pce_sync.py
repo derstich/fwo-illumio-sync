@@ -53,6 +53,7 @@ GROUP_LABEL_KEYS = ["role", "env", "app", "bu", "loc"]
 RS_PREFIX        = "FWO_"            # prefix for PCE rulesets (legacy direct-rule export)
 SYNC_RS_TAG      = "[fwo-sync]"     # description marker — identifies modelling-sync rulesets
 FWO_ALL_WORKLOADS = "ALL_WORKLOADS" # reserved App Role name → PCE "all workloads" (ams)
+FWO_ALL_SERVICES  = "ALL_SERVICES"  # reserved FWO service name → PCE "All Services"
 
 VERIFY_SSL    = False
 requests.packages.urllib3.disable_warnings()
@@ -1074,10 +1075,20 @@ def sync_export_modelling(token, dry_run):
                 log.warning(f"    IP nwobject {ip} skipped — use App Roles for workload actors")
         return actors or [{"actors": "ams"}], env_seg
 
+    # Resolve PCE "All Services" href once
+    all_services_href = next(
+        (s["href"] for s in pce_services_raw if s.get("name") == "All Services"),
+        f"/orgs/{PCE_ORG}/sec_policy/draft/services/1"
+    )
+
     def _ingress(svc_connections):
         result = []
         for sc in svc_connections:
             s = sc["service"]
+            if (s.get("name") or "").strip() == FWO_ALL_SERVICES:
+                result.append({"href": all_services_href})
+                log.info(f"    Service '{s['name']}' → PCE 'All Services'")
+                continue
             matched = _resolve_pce_service(s.get("name"), s.get("port"), s.get("proto_id"))
             if matched:
                 result.append({"href": matched["href"]})
@@ -1090,7 +1101,7 @@ def sync_export_modelling(token, dry_run):
                     entry["to_port"] = s["port_end"]
                 result.append(entry)
                 log.info(f"    Service '{s.get('name')}' → inline port {s.get('port')}/proto {s.get('proto_id')} (no PCE match)")
-        return result or [{"href": f"/orgs/{PCE_ORG}/sec_policy/draft/services/1"}]
+        return result or [{"href": all_services_href}]
 
     provisioned = False
 
