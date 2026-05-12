@@ -1373,12 +1373,22 @@ def main():
     token = fwo_token()
     log.info("FWO authenticated ✓")
 
+    # Step A: assign ar=WL-<IP> labels in PCE
     if not args.export_only:
         wl_to_ar = label_workloads_by_ip(workloads, args.dry_run)
-        sync_import(token, workloads, wl_to_ar, args.dry_run)
 
+    # Step B: read FWO Modelling named roles → set env/app/role labels on workloads in PCE
+    #         Must run before sync_import so the labels are visible when building PCE_* objects.
     if not args.import_only:
         sync_modelling_nwgroups(token, workloads, args.dry_run)
+
+    # Step C: import workloads into FWO — now env/app/role labels are already on workloads,
+    #         so PCE_env_X / PCE_app_X / PCE_role_X network objects are created here.
+    if not args.export_only:
+        sync_import(token, workloads, wl_to_ar, args.dry_run)
+
+    # Step D: create Modelling App Role dim groups + export connections to PCE
+    if not args.import_only:
         sync_label_dim_groups(token, workloads, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
