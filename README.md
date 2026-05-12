@@ -21,19 +21,19 @@ It solves a core problem in heterogeneous enterprise environments: maintaining a
 
 FWO is actively maintained (v9.0+) and trusted by IT service providers, financial institutions, and online retailers managing large-scale firewall estates.
 
-This integration leverages FWO's **Modelling module** as the policy design surface, with Illumio PCE as the enforcement engine.
+This integration uses FWO's **Modelling module** as the policy design surface, with Illumio PCE as the enforcement engine.
 
 ---
 
 ## ⚠️ Disclaimer / Important Notice
 
-> **This integration is a transitional workaround — not a target architecture.**
+> **This integration is a transitional tool — not a target architecture.**
 >
-> Illumio is built around a **label-based micro-segmentation model**. Policies are expressed through labels (`role`, `env`, `app`, `loc`, `bu`) assigned to workloads, not through traditional IP-address-based firewall rules. The native Illumio approach should be the goal for any greenfield deployment or mature migration.
+> Illumio is built around a **label-based micro-segmentation model**. Policies are expressed through labels (`role`, `env`, `app`, `loc`, `bu`) assigned to workloads. The native Illumio approach — described in this README as the **recommended path** — should be the goal for any deployment.
 >
-> This project exists to bridge a specific gap: organisations that are **migrating from a classical firewall-rule model** (managed in FWO) to Illumio segmentation, and need a **temporary, consistent mapping** between the two worlds during the transition period. It allows security teams to continue working in their familiar FWO modelling workflow while Illumio enforces the resulting policy.
+> This project exists to bridge a specific gap: organisations **migrating from a classical firewall-rule model** (managed in FWO) to Illumio segmentation. It allows security teams to continue working in their familiar FWO Modelling workflow while Illumio enforces the resulting policy.
 >
-> **This approach has inherent limitations** (see [Caveats](#caveats--limitations)) and should be replaced by native Illumio label-based policy design as soon as the migration is complete.
+> The AR label-group fallback (described at the end of this README) is provided **only for brownfield scenarios** where a full label-based migration is not yet possible. It should be replaced by native label-based policy as soon as feasible.
 
 ---
 
@@ -43,11 +43,11 @@ This integration leverages FWO's **Modelling module** as the policy design surfa
 ┌─────────────────────────────┐        ┌──────────────────────────────┐
 │   Illumio PCE               │        │   FireWall Orchestrator (FWO) │
 │                             │        │                               │
-│  Workloads (managed +       │◄──────►│  Network Objects  WL-<IP>     │
-│  unmanaged) with labels     │ import │  Object Groups    PCE_*       │
+│  Workloads with             │◄──────►│  Network Objects  WL-<IP>     │
+│  env/app/role labels        │ import │                               │
 │                             │        │                               │
-│  Label Groups (ar=*)        │◄──────►│  Modelling nwgroups  AR*      │
-│  Rulesets FWO_MODELLING_*   │ export │  Modelling connections        │
+│  Scoped Rulesets            │◄──────►│  Modelling App Roles          │
+│  (label-based actors)       │ export │  <ENV>-<APP>-<ROLE>           │
 └─────────────────────────────┘        └──────────────────────────────┘
          ▲
          │ PostgreSQL LISTEN/NOTIFY
@@ -60,26 +60,116 @@ This integration leverages FWO's **Modelling module** as the policy design surfa
    (fwo_pce_sync.py)
 ```
 
-### What the sync does
+---
 
-**Import (PCE → FWO)**
-- Creates/updates FWO host objects `WL-<IP>` for every PCE workload (managed + unmanaged)
-- Assigns PCE label `ar=WL-<IP>` to each workload as a stable identity anchor
-- Creates FWO object groups `PCE_<key>_<value>` from PCE labels (`role`, `env`, `app`, `bu`, `loc`)
-- Populates `owner_network` (FWO Modelling App Servers) so workloads are selectable in the Modelling module
-- Reconciles: workloads removed from PCE are marked as deleted in FWO
+## Policy Model: Label-Based (Recommended)
 
-**Export (FWO → PCE)**
-- Syncs FWO Modelling **nwgroups** (App Roles) → PCE label groups (`key=ar`)
-- Syncs FWO Modelling **connections** → PCE rulesets `FWO_MODELLING_<name>`
-- Resolves service names: FWO service name matched against PCE named services (e.g. `HTTP` → `S-HTTP`)
-- Reconciles: connections/groups deleted in FWO are removed from PCE
-- **Only writes when data actually changed** — no unnecessary PCE provisions per cron cycle
+Illumio's native segmentation model assigns **labels** to workloads (`env`, `app`, `role`, `loc`, `bu`) and expresses policy in terms of those labels — not IP addresses. A rule that says *"env=prod, app=webapp, role=web can talk to env=prod, app=db, role=data on port 5432"* automatically follows workloads as they move, scale, or change IPs.
 
-**Instant trigger**
-- PostgreSQL `LISTEN/NOTIFY` triggers fire on every `INSERT/UPDATE/DELETE` on the modelling tables
-- `fwo_sync_daemon.py` picks up the notification with a 2-second debounce and immediately runs `--export-only`
-- This means PCE is updated within seconds of pressing **Save** in FWO Modelling
+This integration maps FWO Modelling App Roles directly to this model using a naming convention.
+
+### App Role Naming Convention: `<ENV>-<APP>-<ROLE>`
+
+Name your FWO Modelling App Roles using three dash-separated segments:
+
+```
+prod-webapp-web     →  env=prod,  app=webapp,  role=web
+prod-db-data        →  env=prod,  app=db,       role=data
+dev-api-backend     →  env=dev,   app=api,      role=backend
+```
+
+- Segments are taken **exactly as written** (case-sensitive)
+- Exactly 3 segments separated by `-`
+- Each segment maps to one Illumio label key: `env` · `app` · `role`
+
+> **Tip:** Pick a casing convention and stick to it. `prod` ≠ `Prod` ≠ `PROD` — inconsistent casing creates separate labels.
+
+### What the sync does automatically
+
+1. **Parses the name** into `(env, app, role)` segments
+2. **Creates PCE labels** for each segment value if they don't exist yet
+3. **Assigns labels to member workloads** — workloads in `prod-webapp-web` receive `env=prod`, `app=webapp`, `role=web`; existing `ar`, `bu`, `loc` labels are preserved
+4. **Removes labels** when a workload is removed from a named App Role; deletes orphaned PCE labels
+5. **Validates uniqueness** — a workload may only belong to one named App Role; the DB trigger blocks conflicting assignments at save time
+6. **Creates scoped PCE rulesets** from Modelling connections:
+   - Same env on both sides → ruleset scoped to `[[env=<ENV>]]`, actors are `[app=…, role=…]`
+   - Different envs → global scope, env label prepended to each actor list
+7. **Removes env/app/role labels** from workloads no longer in any named App Role and **deletes unused PCE labels** (graceful skip if still referenced by a ruleset)
+
+### Connection → PCE Ruleset Example
+
+FWO Modelling connection **`prod-webapp-web → prod-db-data`** on port 5432 produces:
+
+```json
+{
+  "name": "webapp-to-db",
+  "description": "[fwo-sync]",
+  "scopes": [[{"label": {"href": "/orgs/1/labels/<env-prod>"}}]],
+  "rules": [{
+    "consumers":          [{"label": app=webapp}, {"label": role=web}],
+    "providers":          [{"label": app=db},     {"label": role=data}],
+    "ingress_services":   [{"href": ".../S-POSTGRESQL"}],
+    "unscoped_consumers": false
+  }]
+}
+```
+
+Cross-environment connection **`prod-webapp-web → dev-db-data`**:
+
+```json
+{
+  "name": "webapp-prod-to-db-dev",
+  "scopes": [[]],
+  "rules": [{
+    "consumers":          [{"label": env=prod}, {"label": app=webapp}, {"label": role=web}],
+    "providers":          [{"label": env=dev},  {"label": app=db},     {"label": role=data}],
+    "unscoped_consumers": true
+  }]
+}
+```
+
+### Special Actors
+
+| FWO Modelling object | PCE actor |
+|---|---|
+| App Role named `ALL_WORKLOADS` | `{"actors": "ams"}` — all workloads |
+| Network object with IP `0.0.0.0` | `{"ip_list": ...}` — PCE "Any (0.0.0.0/0 and ::/0)" |
+
+### PCE Label Hygiene
+
+**Greenfield deployment:**
+> Delete all pre-existing `env`, `app`, and `role` labels before the first sync. The sync creates exactly the labels it needs, derived from App Role names.
+
+**Brownfield — existing labels:**
+> Audit `env`, `app`, and `role` labels before enabling named App Roles. Remove duplicates (`prod` vs `PROD` vs `Production` → pick one). Name your App Role segments to match the **exact value** of your existing PCE labels.
+
+```bash
+# Review existing env/app/role labels
+curl -su "api_<key>:<secret>" \
+  "https://<pce>:8443/api/v2/orgs/1/labels?max_results=500" \
+  | jq '[.[] | select(.key == "env" or .key == "app" or .key == "role") | {key, value}]'
+```
+
+---
+
+## Policy Model: AR Label-Groups (Brownfield Fallback Only)
+
+> **Use this approach only if a label-based migration is not yet feasible.** It bypasses Illumio's native workload identity model and should be treated as a temporary measure.
+
+In this mode, FWO App Roles with names that do **not** match `<ENV>-<APP>-<ROLE>` (e.g. `AR9904567-001`) are synchronised as PCE **label groups** using the `ar` label key:
+
+- Each PCE workload receives a unique `ar=WL-<IP>` label as an identity anchor
+- App Role members are collected as ar-label hrefs → PCE label group `AR9904567-001` (key=ar)
+- Connections referencing these App Roles produce PCE rulesets with `{"label_group": ...}` actors
+
+This is fully backward-compatible. Named (`<ENV>-<APP>-<ROLE>`) and AR-style App Roles can coexist in the same FWO Modelling application.
+
+### Limitations of the AR approach
+
+1. **IP-centric identity** — the `ar=WL-<IP>` label ties workload identity to an IP address. Illumio's strength (identity independent of IP) is not used.
+2. **No label inheritance** — workloads do not receive meaningful `env`/`app`/`role` labels; Illumio visibility and policy tooling is degraded.
+3. **Unscoped rulesets** — rules apply globally, not scoped to an environment or application.
+4. **FWO is authoritative** — direct changes to sync-managed rulesets in the PCE UI are overwritten on the next sync.
 
 ---
 
@@ -108,7 +198,7 @@ fwo-illumio-sync/
 ├── fwo_pce_sync.py          # Main sync script (cron)
 ├── fwo_sync_daemon.py       # PostgreSQL NOTIFY daemon (systemd)
 ├── sql/
-│   └── triggers.sql         # DB triggers for instant sync
+│   └── triggers.sql         # DB triggers for instant sync + uniqueness enforcement
 └── systemd/
     └── fwo-sync-daemon.service
 ```
@@ -132,7 +222,7 @@ Edit the `Config` section at the top of `fwo_pce_sync.py`:
 
 ```python
 FWO_GRAPHQL   = "https://localhost:9443/api/v1/graphql"
-FWO_AUTH_URL  = "http://127.0.0.1:8880/api/AuthenticationToken/Get"
+FWO_AUTH_URL  = "http://localhost:8880/api/AuthenticationToken/Get"
 FWO_USER      = "admin"
 FWO_PASS      = "<fwo-admin-password>"
 FWO_MGM_ID    = 7        # Management ID of your Illumio device in FWO
@@ -150,11 +240,15 @@ sudo -u postgres psql fworchdb -c "SELECT id, name FROM management;"
 sudo -u postgres psql fworchdb -c "SELECT id, name FROM owner;"
 ```
 
-### 3. Install PostgreSQL NOTIFY triggers
+### 3. Install PostgreSQL triggers
 
 ```bash
 sudo -u postgres psql fworchdb -f sql/triggers.sql
 ```
+
+This installs:
+- **NOTIFY triggers** — instant sync on every Modelling save
+- **Uniqueness trigger** — blocks assigning a workload to multiple named App Roles at DB level
 
 ### 4. Install and start the daemon
 
@@ -182,81 +276,7 @@ sudo python3 /usr/local/fworch/bin/fwo_pce_sync.py
 
 ---
 
-## Label-Based Policy (Recommended)
-
-App Roles in FWO Modelling can follow the `<ENV>-<APP>-<ROLE>` naming convention to automatically drive PCE label assignment and produce scoped, label-based rulesets — the native Illumio approach.
-
-### PCE Label Hygiene (important)
-
-The sync derives PCE labels **exactly** from App Role name segments — case-sensitive, no transformation. `DeV-APP03-web` produces `env=DeV`, `app=APP03`, `role=web`. If a label with that exact value does not exist in the PCE it is created automatically.
-
-The App Role name in FWO is the single source of truth for label values. Inconsistent casing across groups creates separate labels (`dev` ≠ `Dev` ≠ `DEV`) — so pick a convention and stick to it.
-
-**Greenfield deployment:**
-> Delete all pre-existing `env`, `app`, and `role` labels before running the sync. The sync will create exactly the labels it needs, derived from App Role names.
-
-**Brownfield / existing label infrastructure:**
-> Audit all `env`, `app`, and `role` labels before enabling named App Roles:
-> - Remove duplicates and aliases (`prod`, `PROD`, `Production` → pick one)
-> - Name your App Role segments to match the exact casing of existing PCE labels
-> - Example: if your PCE uses `env=Production`, name the App Role `Production-APP01-web`
-
-```bash
-# List all env/app/role labels in the PCE to review
-curl -su "api_<key>:<secret>" \
-  "https://<pce>:8443/api/v2/orgs/1/labels?max_results=500" \
-  | jq '[.[] | select(.key == "env" or .key == "app" or .key == "role") | {key, value}]'
-```
-
----
-
-### Naming Convention
-
-```
-PR-WEBAPP-WEB     →  env=PR,  app=WEBAPP,  role=WEB
-DR-DB-DATA        →  env=DR,  app=DB,      role=DATA
-PROD-API-BACKEND  →  env=PROD, app=API,    role=BACKEND
-```
-
-- Segments are uppercase alphanumeric, separated by `-`
-- At least one character per segment
-- Exactly 3 segments: Environment · Application · Role
-
-### What the sync does for named App Roles
-
-1. **Parses the name** into `(env, app, role)` components
-2. **Creates PCE labels** `env=<ENV>`, `app=<APP>`, `role=<ROLE>` if they don't exist
-3. **Sets those labels on member workloads** — workloads assigned to `PR-WEBAPP-WEB` receive `env=PR`, `app=WEBAPP`, `role=WEB` (existing `ar`, `bu`, `loc` labels are preserved)
-4. **Connections between named roles produce scoped rulesets**:
-   - If source and destination share the same `env` → ruleset scope `[[env=<ENV>]]`, consumers not unscoped
-   - Otherwise → global scope `[[]]`
-   - Actors are PCE label refs (`app=…`, `role=…`) — not ar-label-groups
-
-### Example
-
-FWO Modelling connection `PR-WEBAPP-WEB → PR-DB-DATA` produces:
-
-```json
-{
-  "name": "FWO_MODELLING_WEB-TO-DB",
-  "scopes": [[{"label": {"href": "/orgs/1/labels/<env-PR>"}}]],
-  "rules": [{
-    "consumers":        [{"label": app=WEBAPP}, {"label": role=WEB}],
-    "providers":        [{"label": app=DB},     {"label": role=DATA}],
-    "unscoped_consumers": false
-  }]
-}
-```
-
-### Backward Compatibility
-
-App Roles whose names do **not** match the `<ENV>-<APP>-<ROLE>` pattern (e.g. `AR9904567-001`) continue to use the existing ar-label-group approach unchanged. Both styles can coexist in the same FWO Modelling application.
-
----
-
 ## FWO Modelling Setup
-
-After the initial import, the following FWO Modelling objects are needed:
 
 ### Network Areas (optional but recommended)
 
@@ -291,9 +311,9 @@ Create standard services in FWO Modelling (Administration → Services). The syn
 
 ## PCE Requirements
 
-- API user with **Read/Write** access to workloads, labels, label groups, rule sets, services
+- API user with **Read/Write** access to workloads, labels, label groups, rule sets, IP lists, services
 - Workloads (managed and unmanaged) must be registered in the PCE
-- Labels for segmentation (`role`, `env`, `app`, `bu`, `loc`) should already be assigned — the sync reads them to build FWO object groups
+- The **"Any (0.0.0.0/0 and ::/0)"** IP list must exist in the PCE if you use `0.0.0.0` network objects in FWO connections
 
 ---
 
@@ -304,10 +324,11 @@ The sync is designed to be idempotent and efficient:
 | Component | Change detection |
 |-----------|-----------------|
 | PCE ar-labels | Compares current label href on workload |
+| PCE env/app/role labels | Set from App Role name; removed when workload leaves named role |
 | FWO host objects | Skips if `obj_name` and `obj_uid` unchanged |
 | FWO group objects | Skips if `obj_uid` (PCE label href) unchanged |
 | PCE label groups | Compares sorted member hrefs |
-| PCE rulesets | Compares consumer/provider/service hrefs |
+| PCE rulesets | Compares consumer/provider/service hrefs via signature |
 | owner_network (App Servers) | Always ensures `is_deleted=false` for active workloads |
 
 If nothing changed, no `import_control` entry is written, `latest_config` is not rebuilt, and no PCE provision is triggered.
@@ -316,19 +337,17 @@ If nothing changed, no `import_control` entry is written, `latest_config` is not
 
 ## Caveats & Limitations
 
-1. **IP-centric, not label-centric**: This sync uses IP addresses as the primary identity (`ar=WL-<IP>`). Illumio's strength is workload identity independent of IP. This approach loses that benefit.
+1. **Label-based approach requires naming discipline** — App Role names drive PCE label values directly. Renaming an App Role is a breaking change; the old labels will be removed from workloads and the old ruleset deleted.
 
-2. **FWO as authoritative source**: Policy changes must be made in FWO Modelling. Direct changes to `FWO_MODELLING_*` rulesets in the PCE UI will be overwritten on the next sync.
+2. **FWO is authoritative** — direct changes to sync-managed rulesets in the PCE UI are overwritten on the next sync.
 
-3. **PCE label groups created by sync**: Label groups with `key=ar` whose names appear in FWO history are managed exclusively by the sync. Do not rename them in the PCE.
+3. **AR label groups (legacy)** — groups with `key=ar` whose names appear in FWO history are managed exclusively by the sync. Do not rename them in the PCE. Manually created `key=ar` groups with names unknown to FWO are never touched.
 
-4. **Manually created PCE label groups are preserved**: The reconciliation only deletes PCE label groups that are known to FWO (appeared in FWO nwgroup history). Groups created directly in PCE with `key=ar` and a name not known to FWO will not be touched.
+4. **Service name mapping is heuristic** — the FWO→PCE service name resolution uses name-based matching with fallback. Ambiguous names (e.g. `FTP` matching both `S-FTP-CONTROL` and `S-FTP-DATA`) require port disambiguation or exact naming.
 
-5. **Service name mapping is heuristic**: The FWO→PCE service name resolution uses name-based matching with fallback. Ambiguous names (e.g. `FTP` matching both `S-FTP-CONTROL` and `S-FTP-DATA`) require port disambiguation or exact naming.
+5. **No multi-tenancy** — the sync is scoped to a single FWO management (`FWO_MGM_ID`) and a single PCE organisation (`PCE_ORG`).
 
-6. **No multi-tenancy**: The sync is scoped to a single FWO management (`FWO_MGM_ID`) and a single PCE organisation (`PCE_ORG`).
-
-7. **Unpair/re-pair cycle**: When a workload is unpaired from PCE and re-registered, the sync automatically restores its FWO objects and `owner_network` entry on the next run. There may be a brief window (up to 1 minute) where the object shows as deleted in FWO.
+6. **Unpair/re-pair cycle** — when a workload is unpaired from PCE and re-registered, the sync restores its FWO objects on the next run. There may be a brief window (up to 1 minute) where the object shows as deleted in FWO.
 
 ---
 
@@ -339,6 +358,16 @@ If nothing changed, no `import_control` entry is written, `latest_config` is not
 ```bash
 sudo -u postgres psql fworchdb -c \
   "UPDATE owner_network SET is_deleted=false WHERE ip='<ip>/32' AND import_source='pce_sync';"
+```
+
+**Workload blocked from joining a named App Role**
+→ The uniqueness trigger fired — the workload is already in another named role. Check:
+```bash
+sudo -u postgres psql fworchdb -c \
+  "SELECT g.name FROM modelling.nwgroup g
+   JOIN modelling.nwobject_nwgroup og ON og.nwgroup_id = g.id
+   JOIN owner_network n ON n.id = og.nwobject_id
+   WHERE n.ip = '<ip>/32' AND g.name ~ '^[A-Z0-9]+-[A-Z0-9]+-[A-Z0-9]+$';"
 ```
 
 **PCE label group deleted unexpectedly**
@@ -352,13 +381,13 @@ sudo -u postgres psql fworchdb -c \
 → Check triggers are installed and daemon is running:
 ```bash
 sudo -u postgres psql fworchdb -c \
-  "SELECT trigger_name, event_object_table FROM information_schema.triggers WHERE trigger_name LIKE 'trg_notify%';"
+  "SELECT trigger_name, event_object_table FROM information_schema.triggers WHERE trigger_name LIKE 'trg_%';"
 sudo systemctl status fwo-sync-daemon
 sudo journalctl -u fwo-sync-daemon -n 30
 ```
 
-**HTTP 406 on PCE label group update**
-→ The `key` field must not be included in PUT requests to the PCE. This is handled automatically — do not add `key` to update bodies.
+**`Any (0.0.0.0/0 and ::/0)` IP list not found**
+→ Create it in the PCE under *Policy Objects → IP Lists → New*, add range `0.0.0.0/0`.
 
 ---
 

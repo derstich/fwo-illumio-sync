@@ -976,17 +976,21 @@ def sync_export_modelling(token, dry_run):
     rs_by_name = {rs["name"]: rs for rs in existing_rs}
     pce_groups_by_name = {g["name"]: g for g in existing_pce_groups}
 
-    # PCE "Any (0.0.0.0/0)" IP list — used when FWO nwobject IP is 0.0.0.0
+    # PCE "Any (0.0.0.0/0 and ::/0)" IP list — used when FWO nwobject IP is 0.0.0.0
     pce_ip_lists = pce_get(f"/orgs/{PCE_ORG}/sec_policy/draft/ip_lists", {"max_results": 500})
     any_ip_list_href = next(
+        (il["href"] for il in pce_ip_lists
+         if il.get("name") == "Any (0.0.0.0/0 and ::/0)"),
+        None
+    ) or next(                      # fallback: search by IP range if name differs
         (il["href"] for il in pce_ip_lists
          if any(r.get("from_ip") == "0.0.0.0" for r in il.get("ip_ranges", []))),
         None
     )
     if any_ip_list_href:
-        log.info(f"  Any IP list: {any_ip_list_href.split('/')[-1]}")
+        log.info(f"  Any IP list found: {any_ip_list_href.split('/')[-1]}")
     else:
-        log.warning("  No 'Any (0.0.0.0/0)' IP list found in PCE — 0.0.0.0 nwobjects will be skipped")
+        log.warning("  'Any (0.0.0.0/0 and ::/0)' IP list not found in PCE — 0.0.0.0 nwobjects will be skipped")
 
     # PCE named services — build lookup by name and by port+proto
     pce_services_raw = pce_get(f"/orgs/{PCE_ORG}/sec_policy/draft/services", {"max_results": 500})
