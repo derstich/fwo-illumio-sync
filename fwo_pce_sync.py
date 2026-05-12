@@ -806,9 +806,18 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
     provisioned = False
     for grp in groups:
         grp_name = grp["name"]
-        # Map owner_network entries to PCE ar-label hrefs
+
+        # ALL_WORKLOADS is a virtual group — no PCE label group needed, handled in export
+        if grp_name == FWO_ALL_WORKLOADS:
+            log.info(f"  Skip '{grp_name}' — virtual group, maps to PCE ams actor")
+            continue
+
+        # Map owner_network entries to PCE ar-label hrefs (skip 0.0.0.0 placeholder)
         label_hrefs = []
         for entry in grp["nwobject_nwgroups"]:
+            ip = str(entry["owner_network"]["ip"]).split("/")[0]
+            if ip == "0.0.0.0":
+                continue  # placeholder for ANY — not a real workload
             nw_name = entry["owner_network"]["name"]  # e.g. WL-172.24.50.161
             href = label_by_name.get(nw_name)
             if href:
