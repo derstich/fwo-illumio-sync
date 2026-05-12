@@ -198,7 +198,8 @@ fwo-illumio-sync/
 ├── fwo_pce_sync.py          # Main sync script (cron)
 ├── fwo_sync_daemon.py       # PostgreSQL NOTIFY daemon (systemd)
 ├── sql/
-│   └── triggers.sql         # DB triggers for instant sync + uniqueness enforcement
+│   ├── triggers.sql         # DB triggers: instant sync + uniqueness enforcement
+│   └── initial_objects.sql  # One-time setup: ANY, ALL_WORKLOADS, ALL_SERVICES
 └── systemd/
     └── fwo-sync-daemon.service
 ```
@@ -249,6 +250,22 @@ sudo -u postgres psql fworchdb -f sql/triggers.sql
 This installs:
 - **NOTIFY triggers** — instant sync on every Modelling save
 - **Uniqueness trigger** — blocks assigning a workload to multiple named App Roles at DB level
+
+### 3b. Create initial Modelling objects
+
+```bash
+sudo -u postgres psql fworchdb -f sql/initial_objects.sql
+```
+
+This creates three reserved objects used by the sync for special PCE actors:
+
+| Object | Type | PCE mapping |
+|--------|------|-------------|
+| `ANY` (`0.0.0.0/32`) | Network object | `Any (0.0.0.0/0 and ::/0)` IP list |
+| `ALL_WORKLOADS` | App Role (with ANY as member) | `{"actors": "ams"}` — all workloads |
+| `ALL_SERVICES` | Service (no port/proto) | PCE `All Services` |
+
+> If your `app_id` or `owner_id` differ from the defaults (both `3`), edit the `\set` lines at the top of `sql/initial_objects.sql` before running.
 
 ### 4. Install and start the daemon
 
