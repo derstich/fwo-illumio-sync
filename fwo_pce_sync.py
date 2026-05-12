@@ -225,7 +225,7 @@ def fwo_token():
     r.raise_for_status()
     return r.text.strip()
 
-def fwo_gql(token, query, variables=None, allow_errors=False):
+def fwo_gql(token, query, variables=None):
     r = requests.post(FWO_GRAPHQL,
                       headers={"Authorization": f"Bearer {token}",
                                "Content-Type": "application/json"},
@@ -234,9 +234,6 @@ def fwo_gql(token, query, variables=None, allow_errors=False):
     r.raise_for_status()
     d = r.json()
     if "errors" in d:
-        if allow_errors:
-            log.debug(f"GraphQL error (non-fatal): {d['errors']}")
-            return None
         raise RuntimeError(f"GraphQL error: {d['errors']}")
     return d["data"]
 
@@ -749,9 +746,6 @@ MODELLING_PREFIX     = RS_PREFIX + "MODELLING_"  # legacy prefix (migrated away 
 # Matches <ENV>-<APP>-<ROLE>  e.g.  PR-WEBAPP-WEB  DR-DB-DATA
 ROLE_NAME_RE = re.compile(r'^([A-Z0-9]+)-([A-Z0-9]+)-([A-Z0-9]+)$')
 
-# Matches PCE_<key>_<value>  e.g.  PCE_env_PROD  PCE_app_APP13  PCE_role_WEB
-PCE_LABEL_GRP_RE = re.compile(r'^PCE_(env|app|role|bu|loc)_(.+)$')
-
 
 def _pce_delete_ruleset(href, name, dry_run):
     if dry_run:
@@ -931,133 +925,6 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
                                     f"{r.status_code} {r.text[:100]}")
 
 
-def sync_label_dim_groups(token, workloads, dry_run):
-    """Create/update PCE_<key>_<value> App Role groups in FWO Modelling.
-    Reads env/app/role labels from the already-fetched workload list and maps them
-    to owner_network entries via FWO GraphQL.  No psql, no extra PCE API calls."""
-    log.info("── STEP 3d: Workload labels → FWO Modelling dim groups ─────────")
-
-    LABEL_DIM_KEYS = ("env", "app", "role")
-
-    # Build IP → set of label (key, value) from workloads already in memory
-    ip_to_labels: dict[str, set] = {}
-    for wl in workloads:
-        ip = primary_ip(wl)
-        if not ip:
-            continue
-        for lbl in wl.get("labels", []):
-            if lbl.get("key") in LABEL_DIM_KEYS and lbl.get("value"):
-                ip_to_labels.setdefault(ip, set()).add((lbl["key"], lbl["value"]))
-
-    # Invert to dim → set of IPs
-    dim_to_ips: dict[tuple, set] = {}
-    for ip, labels in ip_to_labels.items():
-        for kv in labels:
-            dim_to_ips.setdefault(kv, set()).add(ip)
-
-    if not dim_to_ips:
-        log.info("  No labeled workloads — nothing to create")
-        return
-
-    log.info(f"  {len(dim_to_ips)} dimension(s) found across {len(ip_to_labels)} workloads")
-
-    # Load existing modelling App Role groups WITH their owner_network members.
-    # owner_network is not a top-level GraphQL query in FWO — access via nested relation only.
-    gdata = fwo_gql(token, """query {
-      modelling_nwgroup(where: {app_id: {_eq: 3}, group_type: {_eq: 20}, is_deleted: {_eq: false}}) {
-        id name
-        nwobject_nwgroups { nwobject_id owner_network { id ip } }
-      }
-    }""")
-    existing_groups = {g["name"]: g for g in gdata.get("modelling_nwgroup", [])}
-
-    # Build IP → owner_network id from all already-known group members
-    on_by_ip: dict[str, int] = {}
-    for grp in existing_groups.values():
-        for entry in grp.get("nwobject_nwgroups", []):
-            on = entry.get("owner_network") or {}
-            if on.get("id") and on.get("ip"):
-                on_by_ip[str(on["ip"]).split("/")[0]] = on["id"]
-
-    for (key, value), ips in sorted(dim_to_ips.items()):
-        grp_name    = f"PCE_{key}_{value}"
-        desired_ids = {on_by_ip[ip] for ip in ips if ip in on_by_ip}
-        missing     = [ip for ip in ips if ip not in on_by_ip]
-        if missing:
-            log.warning(f"  '{grp_name}': no owner_network entry for {missing} — skipped")
-
-        if grp_name in existing_groups:
-            grp         = existing_groups[grp_name]
-            grp_id      = grp["id"]
-            current_ids = {e["nwobject_id"] for e in grp.get("nwobject_nwgroups", [])}
-        else:
-            if dry_run:
-                log.info(f"  [DRY] Would create nwgroup '{grp_name}'")
-                continue
-            result = fwo_gql(token, """mutation($name: String!) {
-              insert_modelling_nwgroup_one(object: {
-                app_id: 3, name: $name, id_string: $name,
-                group_type: 20, is_deleted: false, creator: "pce_sync"
-              }) { id }
-            }""", {"name": grp_name}, allow_errors=True)
-            if not result:
-                log.error(f"  FAILED to create '{grp_name}' — Hasura mutation not permitted. "
-                          f"Run sql/initial_objects.sql or create the group manually in FWO Modelling.")
-                continue
-            grp_id      = result["insert_modelling_nwgroup_one"]["id"]
-            current_ids = set()
-            log.info(f"  Created  '{grp_name}' (id={grp_id})")
-
-        added = removed = 0
-
-        for on_id in desired_ids - current_ids:
-            if dry_run:
-                log.info(f"    [DRY] Would add on_id={on_id} to '{grp_name}'")
-                continue
-            chk = fwo_gql(token, """query($nw: bigint!, $grp: bigint!) {
-              modelling_nwobject_nwgroup(
-                where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}) { nwobject_id }
-            }""", {"nw": on_id, "grp": grp_id})
-            if not chk.get("modelling_nwobject_nwgroup"):
-                r2 = fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
-                  insert_modelling_nwobject_nwgroup_one(object: {
-                    nwobject_id: $nw, nwgroup_id: $grp
-                  }) { nwobject_id }
-                }""", {"nw": on_id, "grp": grp_id}, allow_errors=True)
-                if not r2:
-                    log.error(f"    FAILED to add member on_id={on_id} to '{grp_name}' — "
-                              f"Hasura mutation not permitted.")
-                    continue
-            added += 1
-
-        for on_id in current_ids - desired_ids:
-            if dry_run:
-                log.info(f"    [DRY] Would remove on_id={on_id} from '{grp_name}'")
-                continue
-            fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
-              delete_modelling_nwobject_nwgroup(
-                where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}
-              ) { affected_rows }
-            }""", {"nw": on_id, "grp": grp_id}, allow_errors=True)
-            removed += 1
-
-        action = "Updated" if added or removed else "OK"
-        log.info(f"  {action:<8} '{grp_name}' ({len(desired_ids)} members"
-                 f"{f', +{added}' if added else ''}{f', -{removed}' if removed else ''})")
-
-    # Reconcile: soft-delete dim groups whose label no longer exists on any workload
-    active_dim_names = {f"PCE_{k}_{v}" for (k, v) in dim_to_ips}
-    for name, grp in existing_groups.items():
-        if PCE_LABEL_GRP_RE.match(name) and name not in active_dim_names:
-            if dry_run:
-                log.info(f"  [DRY] Would soft-delete stale group '{name}'")
-            else:
-                fwo_gql(token, """mutation($id: bigint!) {
-                  update_modelling_nwgroup_by_pk(
-                    pk_columns: {id: $id}, _set: {is_deleted: true}
-                  ) { id }
-                }""", {"id": grp["id"]}, allow_errors=True)
-                log.info(f"  Soft-deleted stale group '{name}'")
 
 
 def _actor_href(a):
@@ -1202,15 +1069,8 @@ def sync_export_modelling(token, dry_run):
                 actors.append({"actors": "ams"})
                 log.info(f"    '{grp_name}' → all workloads (ams)")
                 continue
-            pcl = PCE_LABEL_GRP_RE.match(grp_name)
             parsed = parse_role_name(grp_name)
-            if pcl:
-                lbl_key  = pcl.group(1)   # e.g. "app"
-                lbl_val  = pcl.group(2)   # e.g. "APP13"
-                lbl_href = pce_ensure_label(lbl_key, lbl_val, dry_run)
-                actors.append({"label": {"href": lbl_href}})
-                log.info(f"    '{grp_name}' → PCE label {lbl_key}={lbl_val}")
-            elif parsed:
+            if parsed:
                 env, app, role = parsed
                 app_href  = pce_ensure_label("app",  app,  dry_run)
                 role_href = pce_ensure_label("role", role, dry_run)
@@ -1385,23 +1245,12 @@ def main():
     token = fwo_token()
     log.info("FWO authenticated ✓")
 
-    # Step A: assign ar=WL-<IP> labels in PCE
     if not args.export_only:
         wl_to_ar = label_workloads_by_ip(workloads, args.dry_run)
-
-    # Step B: read FWO Modelling named roles → set env/app/role labels on workloads in PCE
-    #         Must run before sync_import so the labels are visible when building PCE_* objects.
-    if not args.import_only:
-        sync_modelling_nwgroups(token, workloads, args.dry_run)
-
-    # Step C: import workloads into FWO — now env/app/role labels are already on workloads,
-    #         so PCE_env_X / PCE_app_X / PCE_role_X network objects are created here.
-    if not args.export_only:
         sync_import(token, workloads, wl_to_ar, args.dry_run)
 
-    # Step D: create Modelling App Role dim groups + export connections to PCE
     if not args.import_only:
-        sync_label_dim_groups(token, workloads, args.dry_run)
+        sync_modelling_nwgroups(token, workloads, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
     log.info("════════════════════════════════════════════════════════════")
