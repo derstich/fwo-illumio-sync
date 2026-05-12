@@ -1036,6 +1036,23 @@ def sync_export_modelling(token, dry_run):
             return pce_svc_by_port.get((port, proto))
         return None
 
+    def _dedup_actors(actors):
+        """Remove duplicate actors (same label/label_group/ip_list href or actors value)."""
+        seen, result = set(), []
+        for a in actors:
+            if "label"       in a: key = ("label",       a["label"].get("href", ""))
+            elif "label_group" in a: key = ("label_group", a["label_group"].get("href", ""))
+            elif "ip_list"   in a: key = ("ip_list",     a["ip_list"].get("href", ""))
+            elif "actors"    in a: key = ("actors",      a["actors"])
+            else:                  key = str(a)
+            if key not in seen:
+                seen.add(key)
+                result.append(a)
+        if len(result) < len(actors):
+            removed = len(actors) - len(result)
+            log.info(f"    Deduped {removed} duplicate actor(s)")
+        return result
+
     def _actors_with_env(nwobjects, approles):
         """Return (actors_without_env, env_segment_or_None).
         Named roles (<ENV>-<APP>-<ROLE>) → [app_label, role_label] actors, env returned separately.
@@ -1141,6 +1158,8 @@ def sync_export_modelling(token, dry_run):
         rs_name = _rs_name(conn)
         consumers, src_env = _actors_with_env(conn["source_nwobjects"], conn["source_approles"])
         providers, dst_env = _actors_with_env(conn["dest_nwobjects"],   conn["dest_approles"])
+        consumers = _dedup_actors(consumers)
+        providers = _dedup_actors(providers)
         ingress   = _ingress(conn["service_connections"])
 
         # Scope + env-in-actors logic:
