@@ -186,6 +186,34 @@ sudo python3 /usr/local/fworch/bin/fwo_pce_sync.py
 
 App Roles in FWO Modelling can follow the `<ENV>-<APP>-<ROLE>` naming convention to automatically drive PCE label assignment and produce scoped, label-based rulesets — the native Illumio approach.
 
+### PCE Label Hygiene (important)
+
+The sync derives PCE labels directly from App Role name segments (`PR-AP001-WEB` → `env=PR`, `app=AP001`, `role=WEB`). It resolves existing labels in this order:
+
+1. **Exact match** — `WEB` matches label `WEB`
+2. **Case-insensitive** — `WEB` matches label `web`
+3. **Create new** (lowercase) — `web` is created if no match found
+
+Inconsistent or redundant labels in the PCE will cause the sync to create additional labels rather than reuse existing ones (e.g. both `Production` and `PROD` exist → neither matches `PR` → new label `pr` is created).
+
+**Greenfield deployment:**
+> Delete all pre-existing labels for `env`, `app`, and `role` before running the sync. The sync will create exactly the labels it needs, in consistent lowercase form.
+
+**Brownfield / existing label infrastructure:**
+> Audit all labels for `env`, `app`, and `role` before enabling named App Roles:
+> - Remove duplicates and aliases (`prod` vs `PROD` vs `Production` → pick one)
+> - Ensure the value used in PCE matches what you plan to use in App Role names (case-insensitive)
+> - Example: if your PCE has `env=production`, name the App Role segment `PRODUCTION` or `production` — not `prod` or `pr`
+
+```bash
+# List all env/app/role labels in the PCE to review
+curl -su "api_<key>:<secret>" \
+  "https://<pce>:8443/api/v2/orgs/1/labels?max_results=500" \
+  | jq '[.[] | select(.key == "env" or .key == "app" or .key == "role") | {key, value}]'
+```
+
+---
+
 ### Naming Convention
 
 ```

@@ -134,24 +134,53 @@ def parse_role_name(name):
     return (m.group(1), m.group(2), m.group(3)) if m else None
 
 
-_label_cache = {}  # (key, value) → href
+_label_cache = {}     # (key, segment) → href
+_labels_by_key = {}   # key → [label objects]  — populated lazily per key
 
 
-def pce_ensure_label(key, value, dry_run):
-    """Find or create a PCE label for key=value. Returns its href."""
-    cache_key = (key, value)
+def _get_labels_for_key(key):
+    if key not in _labels_by_key:
+        _labels_by_key[key] = pce_get(f"/orgs/{PCE_ORG}/labels",
+                                       {"key": key, "max_results": 500})
+    return _labels_by_key[key]
+
+
+def pce_ensure_label(key, segment, dry_run):
+    """Find or create a PCE label for key=segment.
+
+    Matching order:
+      1. Exact match          (case-sensitive: segment == label.value)
+      2. Case-insensitive     (WEB == web, PR == pr)
+      3. Create new (lowercase) — label did not exist at all
+    """
+    cache_key = (key, segment)
     if cache_key in _label_cache:
         return _label_cache[cache_key]
-    existing = pce_get(f"/orgs/{PCE_ORG}/labels",
-                       {"key": key, "value": value, "max_results": 10})
-    if existing:
-        href = existing[0]["href"]
-    elif dry_run:
-        href = f"/orgs/{PCE_ORG}/labels/dry_{key}_{value}"
+
+    seg_lower = segment.lower()
+    all_labels = _get_labels_for_key(key)
+
+    # 1. Exact
+    for lbl in all_labels:
+        if lbl["value"] == segment:
+            _label_cache[cache_key] = lbl["href"]
+            return lbl["href"]
+
+    # 2. Case-insensitive
+    for lbl in all_labels:
+        if lbl["value"].lower() == seg_lower:
+            log.info(f"  Label {key}={segment} → '{lbl['value']}' (case-insensitive match)")
+            _label_cache[cache_key] = lbl["href"]
+            return lbl["href"]
+
+    # 3. Create new (lowercase)
+    if dry_run:
+        href = f"/orgs/{PCE_ORG}/labels/dry_{key}_{seg_lower}"
     else:
-        result = pce_post(f"/orgs/{PCE_ORG}/labels", {"key": key, "value": value})
+        result = pce_post(f"/orgs/{PCE_ORG}/labels", {"key": key, "value": seg_lower})
         href = result["href"]
-        log.info(f"  Created PCE label {key}={value}: {href}")
+        _labels_by_key[key].append({"href": href, "key": key, "value": seg_lower})
+        log.info(f"  Created PCE label {key}={seg_lower}")
     _label_cache[cache_key] = href
     return href
 
@@ -941,11 +970,12 @@ def sync_export_modelling(token, dry_run):
         return None
 
     def _actors_with_env(nwobjects, approles):
-        """Return (actors, env_value_or_None).
-        Named roles (<ENV>-<APP>-<ROLE>) → label-based actors + env for scope.
+        """Return (actors_without_env, env_segment_or_None).
+        Named roles (<ENV>-<APP>-<ROLE>) → [app_label, role_label] actors, env returned separately.
+        The caller decides whether env goes into scope or into actors.
         Other roles → ar-label-group actor (backward compat)."""
         actors = []
-        env_val = None
+        env_seg = None
         for entry in approles:
             grp_name = entry["nwgroup"]["name"]
             parsed = parse_role_name(grp_name)
@@ -955,7 +985,7 @@ def sync_export_modelling(token, dry_run):
                 role_href = pce_ensure_label("role", role, dry_run)
                 actors += [{"label": {"href": app_href}},
                            {"label": {"href": role_href}}]
-                env_val = env
+                env_seg = env
                 log.info(f"    Role '{grp_name}' → label actors app={app}, role={role}")
             elif grp_name in pce_groups_by_name:
                 actors.append({"label_group": {"href": pce_groups_by_name[grp_name]["href"]}})
@@ -964,7 +994,7 @@ def sync_export_modelling(token, dry_run):
         for entry in nwobjects:
             ip = str(entry["owner_network"]["ip"]).split("/")[0]
             actors.append({"actors": ip})
-        return actors or [{"actors": "ams"}], env_val
+        return actors or [{"actors": "ams"}], env_seg
 
     def _ingress(svc_connections):
         result = []
@@ -1007,7 +1037,9 @@ def sync_export_modelling(token, dry_run):
         providers, dst_env = _actors_with_env(conn["dest_nwobjects"],   conn["dest_approles"])
         ingress   = _ingress(conn["service_connections"])
 
-        # Scope: if both sides are named roles sharing the same env, scope to that env
+        # Scope + env-in-actors logic:
+        #  Same env on both sides → scope to that env; actors contain only app+role
+        #  Different envs          → unscoped; env label prepended to each actor list
         if src_env and dst_env and src_env == dst_env:
             env_href = pce_ensure_label("env", src_env, dry_run)
             scopes   = [[{"label": {"href": env_href}}]]
@@ -1016,6 +1048,12 @@ def sync_export_modelling(token, dry_run):
         else:
             scopes   = [[]]
             unscoped = True
+            if src_env:
+                src_env_href = pce_ensure_label("env", src_env, dry_run)
+                consumers    = [{"label": {"href": src_env_href}}] + consumers
+            if dst_env:
+                dst_env_href = pce_ensure_label("env", dst_env, dry_run)
+                providers    = [{"label": {"href": dst_env_href}}] + providers
 
         rs_body = {
             "name":        rs_name,
