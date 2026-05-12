@@ -930,133 +930,122 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
 
 def sync_label_dim_groups(token, workloads, dry_run):
     """Create/update PCE_<key>_<value> App Role groups in FWO Modelling.
-    Each group collects workloads sharing that label so users can pick e.g.
-    'all APP13 workloads' or 'all PROD workloads' in Modelling connections."""
-    log.info("── STEP 3d: PCE label dimensions → FWO Modelling groups ──────")
-    import subprocess
+    Reads env/app/role labels from the already-fetched workload list and maps them
+    to owner_network entries via FWO GraphQL.  No psql, no extra PCE API calls."""
+    log.info("── STEP 3d: Workload labels → FWO Modelling dim groups ─────────")
 
     LABEL_DIM_KEYS = ("env", "app", "role")
 
-    def psql(sql):
-        r = subprocess.run(
-            ['sudo', '-u', 'postgres', 'psql', '-d', 'fworchdb', '-t', '-A', '-c', sql],
-            capture_output=True, text=True)
-        return r.stdout.strip()
-
-    def esc(v):
-        return v.replace("'", "''")
-
-    # Collect (key, value) → set of IPs from labeled workloads
-    dim_to_ips: dict[tuple, set] = {}
+    # Build IP → set of label (key, value) from workloads already in memory
+    ip_to_labels: dict[str, set] = {}
     for wl in workloads:
         ip = primary_ip(wl)
         if not ip:
             continue
         for lbl in wl.get("labels", []):
             if lbl.get("key") in LABEL_DIM_KEYS and lbl.get("value"):
-                dim_to_ips.setdefault((lbl["key"], lbl["value"]), set()).add(ip)
+                ip_to_labels.setdefault(ip, set()).add((lbl["key"], lbl["value"]))
+
+    # Invert to dim → set of IPs
+    dim_to_ips: dict[tuple, set] = {}
+    for ip, labels in ip_to_labels.items():
+        for kv in labels:
+            dim_to_ips.setdefault(kv, set()).add(ip)
 
     if not dim_to_ips:
         log.info("  No labeled workloads — nothing to create")
         return
 
-    log.info(f"  {len(dim_to_ips)} label dimension(s) found")
+    log.info(f"  {len(dim_to_ips)} dimension(s) found across {len(ip_to_labels)} workloads")
+
+    # Load owner_network entries (IP → id) from FWO via GraphQL
+    on_data = fwo_gql(token, """query($owner: Int!) {
+      owner_network(where: {owner_id: {_eq: $owner}, is_deleted: {_eq: false}, nw_type: {_eq: 10}}) {
+        id ip
+      }
+    }""", {"owner": FWO_OWNER_ID})
+    on_by_ip = {str(r["ip"]).split("/")[0]: r["id"] for r in on_data.get("owner_network", [])}
+
+    # Load existing modelling App Role groups
+    gdata = fwo_gql(token, """query {
+      modelling_nwgroup(where: {app_id: {_eq: 3}, group_type: {_eq: 20}, is_deleted: {_eq: false}}) {
+        id name
+        nwobject_nwgroups { nwobject_id }
+      }
+    }""")
+    existing_groups = {g["name"]: g for g in gdata.get("modelling_nwgroup", [])}
 
     for (key, value), ips in sorted(dim_to_ips.items()):
-        grp_name = f"PCE_{key}_{value}"
+        grp_name    = f"PCE_{key}_{value}"
+        desired_ids = {on_by_ip[ip] for ip in ips if ip in on_by_ip}
+        missing     = [ip for ip in ips if ip not in on_by_ip]
+        if missing:
+            log.warning(f"  '{grp_name}': no owner_network entry for {missing} — skipped")
 
-        # Ensure nwgroup exists
-        existing_id = psql(
-            f"SELECT id FROM modelling.nwgroup "
-            f"WHERE name='{esc(grp_name)}' AND app_id=3 AND is_deleted=false LIMIT 1"
-        )
-        if existing_id:
-            grp_id = int(existing_id)
+        if grp_name in existing_groups:
+            grp         = existing_groups[grp_name]
+            grp_id      = grp["id"]
+            current_ids = {e["nwobject_id"] for e in grp.get("nwobject_nwgroups", [])}
         else:
             if dry_run:
                 log.info(f"  [DRY] Would create nwgroup '{grp_name}'")
                 continue
-            new_id = psql(
-                f"INSERT INTO modelling.nwgroup "
-                f"(app_id, name, id_string, group_type, is_deleted, creator) "
-                f"VALUES (3, '{esc(grp_name)}', '{esc(grp_name)}', 20, false, 'pce_sync') "
-                f"RETURNING id"
-            )
-            if not new_id:
-                log.error(f"  Failed to create nwgroup '{grp_name}'")
-                continue
-            grp_id = int(new_id)
+            result = fwo_gql(token, """mutation($name: String!) {
+              insert_modelling_nwgroup_one(object: {
+                app_id: 3, name: $name, id_string: $name,
+                group_type: 20, is_deleted: false, creator: "pce_sync"
+              }) { id }
+            }""", {"name": grp_name})
+            grp_id      = result["insert_modelling_nwgroup_one"]["id"]
+            current_ids = set()
             log.info(f"  Created  '{grp_name}' (id={grp_id})")
 
-        # Current member IPs from DB
-        rows = psql(
-            f"SELECT on2.ip FROM modelling.nwobject_nwgroup ong "
-            f"JOIN owner_network on2 ON on2.id = ong.nwobject_id "
-            f"WHERE ong.nwgroup_id = {grp_id}"
-        )
-        current_ips = {row.strip().split("/")[0] for row in rows.splitlines() if row.strip()}
+        added = removed = 0
 
-        added = removed_count = 0
-
-        # Add new members
-        for ip in ips - current_ips:
-            cidr = f"{ip}/32"
-            on_id = psql(
-                f"SELECT id FROM owner_network WHERE ip='{cidr}' AND is_deleted=false LIMIT 1"
-            )
-            if not on_id:
-                log.warning(f"    No owner_network entry for {ip} — skipped")
-                continue
+        for on_id in desired_ids - current_ids:
             if dry_run:
-                log.info(f"    [DRY] Would add {ip} to '{grp_name}'")
+                log.info(f"    [DRY] Would add on_id={on_id} to '{grp_name}'")
                 continue
-            psql(
-                f"INSERT INTO modelling.nwobject_nwgroup (nwobject_id, nwgroup_id) "
-                f"VALUES ({on_id}, {grp_id}) ON CONFLICT DO NOTHING"
-            )
+            chk = fwo_gql(token, """query($nw: bigint!, $grp: bigint!) {
+              modelling_nwobject_nwgroup(
+                where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}) { nwobject_id }
+            }""", {"nw": on_id, "grp": grp_id})
+            if not chk.get("modelling_nwobject_nwgroup"):
+                fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
+                  insert_modelling_nwobject_nwgroup_one(object: {
+                    nwobject_id: $nw, nwgroup_id: $grp
+                  }) { nwobject_id }
+                }""", {"nw": on_id, "grp": grp_id})
             added += 1
 
-        # Remove stale members (no longer carry this label)
-        for ip in current_ips - ips:
-            if ip == "0.0.0.0":
-                continue  # never remove placeholder
-            cidr = f"{ip}/32"
-            on_id = psql(f"SELECT id FROM owner_network WHERE ip='{cidr}' LIMIT 1")
-            if not on_id:
-                continue
+        for on_id in current_ids - desired_ids:
             if dry_run:
-                log.info(f"    [DRY] Would remove {ip} from '{grp_name}'")
+                log.info(f"    [DRY] Would remove on_id={on_id} from '{grp_name}'")
                 continue
-            psql(
-                f"DELETE FROM modelling.nwobject_nwgroup "
-                f"WHERE nwobject_id={on_id} AND nwgroup_id={grp_id}"
-            )
-            removed_count += 1
+            fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
+              delete_modelling_nwobject_nwgroup(
+                where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}
+              ) { affected_rows }
+            }""", {"nw": on_id, "grp": grp_id})
+            removed += 1
 
-        action = "Updated" if added or removed_count else "OK"
-        log.info(f"  {action:<8} '{grp_name}' ({len(ips)} members"
-                 f"{f', +{added}' if added else ''}{f', -{removed_count}' if removed_count else ''})")
+        action = "Updated" if added or removed else "OK"
+        log.info(f"  {action:<8} '{grp_name}' ({len(desired_ids)} members"
+                 f"{f', +{added}' if added else ''}{f', -{removed}' if removed else ''})")
 
-    # Reconcile: soft-delete PCE_* dim groups whose label no longer exists on any workload
-    active_grp_names = {f"PCE_{k}_{v}" for (k, v) in dim_to_ips}
-    stale_rows = psql(
-        "SELECT id, name FROM modelling.nwgroup "
-        "WHERE app_id=3 AND group_type=20 AND is_deleted=false "
-        "AND name ~ '^PCE_(env|app|role|bu|loc)_'"
-    )
-    for line in stale_rows.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("|")
-        if len(parts) < 2:
-            continue
-        gid, gname = parts[0].strip(), parts[1].strip()
-        if gname not in active_grp_names:
+    # Reconcile: soft-delete dim groups whose label no longer exists on any workload
+    active_dim_names = {f"PCE_{k}_{v}" for (k, v) in dim_to_ips}
+    for name, grp in existing_groups.items():
+        if PCE_LABEL_GRP_RE.match(name) and name not in active_dim_names:
             if dry_run:
-                log.info(f"  [DRY] Would soft-delete stale group '{gname}'")
+                log.info(f"  [DRY] Would soft-delete stale group '{name}'")
             else:
-                psql(f"UPDATE modelling.nwgroup SET is_deleted=true WHERE id={gid}")
-                log.info(f"  Soft-deleted stale group '{gname}'")
+                fwo_gql(token, """mutation($id: bigint!) {
+                  update_modelling_nwgroup_by_pk(
+                    pk_columns: {id: $id}, _set: {is_deleted: true}
+                  ) { id }
+                }""", {"id": grp["id"]})
+                log.info(f"  Soft-deleted stale group '{name}'")
 
 
 def _actor_href(a):
