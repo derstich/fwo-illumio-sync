@@ -188,22 +188,18 @@ App Roles in FWO Modelling can follow the `<ENV>-<APP>-<ROLE>` naming convention
 
 ### PCE Label Hygiene (important)
 
-The sync derives PCE labels directly from App Role name segments (`PR-AP001-WEB` → `env=PR`, `app=AP001`, `role=WEB`). It resolves existing labels in this order:
+The sync derives PCE labels **exactly** from App Role name segments — case-sensitive, no transformation. `DeV-APP03-web` produces `env=DeV`, `app=APP03`, `role=web`. If a label with that exact value does not exist in the PCE it is created automatically.
 
-1. **Exact match** — `WEB` matches label `WEB`
-2. **Case-insensitive** — `WEB` matches label `web`
-3. **Create new** (lowercase) — `web` is created if no match found
-
-Inconsistent or redundant labels in the PCE will cause the sync to create additional labels rather than reuse existing ones (e.g. both `Production` and `PROD` exist → neither matches `PR` → new label `pr` is created).
+The App Role name in FWO is the single source of truth for label values. Inconsistent casing across groups creates separate labels (`dev` ≠ `Dev` ≠ `DEV`) — so pick a convention and stick to it.
 
 **Greenfield deployment:**
-> Delete all pre-existing labels for `env`, `app`, and `role` before running the sync. The sync will create exactly the labels it needs, in consistent lowercase form.
+> Delete all pre-existing `env`, `app`, and `role` labels before running the sync. The sync will create exactly the labels it needs, derived from App Role names.
 
 **Brownfield / existing label infrastructure:**
-> Audit all labels for `env`, `app`, and `role` before enabling named App Roles:
-> - Remove duplicates and aliases (`prod` vs `PROD` vs `Production` → pick one)
-> - Ensure the value used in PCE matches what you plan to use in App Role names (case-insensitive)
-> - Example: if your PCE has `env=production`, name the App Role segment `PRODUCTION` or `production` — not `prod` or `pr`
+> Audit all `env`, `app`, and `role` labels before enabling named App Roles:
+> - Remove duplicates and aliases (`prod`, `PROD`, `Production` → pick one)
+> - Name your App Role segments to match the exact casing of existing PCE labels
+> - Example: if your PCE uses `env=Production`, name the App Role `Production-APP01-web`
 
 ```bash
 # List all env/app/role labels in the PCE to review

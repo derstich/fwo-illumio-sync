@@ -145,44 +145,44 @@ def _get_labels_for_key(key):
     return _labels_by_key[key]
 
 
-def pce_ensure_label(key, segment, dry_run):
-    """Find or create a PCE label for key=segment.
-
-    Matching order:
-      1. Exact match          (case-sensitive: segment == label.value)
-      2. Case-insensitive     (WEB == web, PR == pr)
-      3. Create new (lowercase) — label did not exist at all
-    """
-    cache_key = (key, segment)
+def pce_ensure_label(key, value, dry_run):
+    """Find or create a PCE label for key=value (exact, case-sensitive)."""
+    cache_key = (key, value)
     if cache_key in _label_cache:
         return _label_cache[cache_key]
 
-    seg_lower = segment.lower()
-    all_labels = _get_labels_for_key(key)
-
-    # 1. Exact
-    for lbl in all_labels:
-        if lbl["value"] == segment:
+    for lbl in _get_labels_for_key(key):
+        if lbl["value"] == value:
             _label_cache[cache_key] = lbl["href"]
             return lbl["href"]
 
-    # 2. Case-insensitive
-    for lbl in all_labels:
-        if lbl["value"].lower() == seg_lower:
-            log.info(f"  Label {key}={segment} → '{lbl['value']}' (case-insensitive match)")
-            _label_cache[cache_key] = lbl["href"]
-            return lbl["href"]
-
-    # 3. Create new (lowercase)
     if dry_run:
-        href = f"/orgs/{PCE_ORG}/labels/dry_{key}_{seg_lower}"
+        href = f"/orgs/{PCE_ORG}/labels/dry_{key}_{value}"
     else:
-        result = pce_post(f"/orgs/{PCE_ORG}/labels", {"key": key, "value": seg_lower})
+        result = pce_post(f"/orgs/{PCE_ORG}/labels", {"key": key, "value": value})
         href = result["href"]
-        _labels_by_key[key].append({"href": href, "key": key, "value": seg_lower})
-        log.info(f"  Created PCE label {key}={seg_lower}")
+        _labels_by_key[key].append({"href": href, "key": key, "value": value})
+        log.info(f"  Created PCE label {key}={value}")
     _label_cache[cache_key] = href
     return href
+
+
+def _clear_workload_role_labels(wl, dry_run):
+    """Remove env/app/role labels from a workload no longer in any named role."""
+    role_keys = {"env", "app", "role"}
+    current   = wl.get("labels", [])
+    to_remove = [l for l in current if l.get("key") in role_keys]
+    if not to_remove:
+        return
+    new_labels   = [l for l in current if l.get("key") not in role_keys]
+    hostname     = wl.get("hostname") or primary_ip(wl)
+    removed_str  = ", ".join(f"{l['key']}={l.get('value','?')}" for l in to_remove)
+    if dry_run:
+        log.info(f"    [DRY] Would remove [{removed_str}] from {hostname}")
+    else:
+        pce_put(wl["href"], {"labels": [{"href": l["href"]} for l in new_labels]})
+        log.info(f"    Removed [{removed_str}] from {hostname}")
+    wl["labels"] = new_labels
 
 
 def _set_workload_role_labels(wl, env_val, app_val, role_val, dry_run):
@@ -872,6 +872,45 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
         pce_provision(dry_run)
     else:
         log.info("  Nothing new to provision")
+
+    # ── Workload label cleanup ────────────────────────────────────────────────
+    # IPs in a named group (non-conflicting) — these already have correct labels set above
+    named_ips = {ip for ip in ip_to_named_groups if ip not in conflicting_ips}
+
+    # Workloads no longer in any named role → strip env/app/role labels
+    log.info("── Workload label cleanup ───────────────────────────────────")
+    for wl in workloads:
+        ip = primary_ip(wl)
+        if ip in conflicting_ips:
+            continue  # ambiguous assignment — don't touch
+        if not ip or ip not in named_ips:
+            _clear_workload_role_labels(wl, dry_run)
+
+    # PCE labels for env/app/role that are no longer on any workload → delete
+    used_label_hrefs = {
+        l["href"]
+        for wl in workloads
+        for l in wl.get("labels", [])
+        if l.get("key") in ("env", "app", "role")
+    }
+    for key in ("env", "app", "role"):
+        for lbl in list(_get_labels_for_key(key)):
+            if lbl["href"] not in used_label_hrefs:
+                if dry_run:
+                    log.info(f"  [DRY] Would delete unused PCE label {key}={lbl['value']}")
+                else:
+                    r = requests.delete(PCE_BASE + lbl["href"],
+                                        auth=PCE_AUTH, verify=VERIFY_SSL)
+                    if r.status_code in (200, 204):
+                        log.info(f"  Deleted unused PCE label {key}={lbl['value']}")
+                        _labels_by_key.pop(key, None)
+                        _label_cache.pop((key, lbl["value"]), None)
+                    elif r.status_code == 406:
+                        log.info(f"  Label {key}={lbl['value']} still referenced "
+                                 f"(ruleset/group) — kept")
+                    else:
+                        log.warning(f"  Delete label {key}={lbl['value']}: "
+                                    f"{r.status_code} {r.text[:100]}")
 
 
 def _actor_href(a):
