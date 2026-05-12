@@ -753,6 +753,25 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
                                    {"max_results": 500})
     pce_groups_by_name = {g["name"]: g for g in existing_pce_groups}
 
+    # ── Conflict check: a workload must not appear in more than one named role ──
+    # Build ip → [group_name, ...] for all named groups
+    named_groups = [g for g in groups if parse_role_name(g["name"])]
+    ip_to_named_groups: dict[str, list[str]] = {}
+    for grp in named_groups:
+        for entry in grp["nwobject_nwgroups"]:
+            ip = str(entry["owner_network"]["ip"]).split("/")[0]
+            ip_to_named_groups.setdefault(ip, []).append(grp["name"])
+
+    # IPs assigned to more than one named role → label assignment would be ambiguous
+    conflicting_ips: set[str] = set()
+    for ip, grp_names in ip_to_named_groups.items():
+        if len(grp_names) > 1:
+            conflicting_ips.add(ip)
+            log.warning(
+                f"  CONFLICT: workload {ip} is member of multiple named roles "
+                f"({', '.join(sorted(grp_names))}) — env/app/role labels will NOT be set on this workload"
+            )
+
     provisioned = False
     for grp in groups:
         grp_name = grp["name"]
@@ -770,13 +789,16 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
             log.info(f"  Skip '{grp_name}' — no resolvable members")
             continue
 
-        # Named groups: set env/app/role labels on member workloads
+        # Named groups: set env/app/role labels on member workloads (skip conflicting IPs)
         parsed = parse_role_name(grp_name)
         if parsed:
             env_val, app_val, role_val = parsed
             log.info(f"  Named role '{grp_name}' → env={env_val}, app={app_val}, role={role_val}")
             for entry in grp["nwobject_nwgroups"]:
                 ip = str(entry["owner_network"]["ip"]).split("/")[0]
+                if ip in conflicting_ips:
+                    log.warning(f"    Skipping label assignment for {ip} (conflict)")
+                    continue
                 wl = wl_by_ip.get(ip)
                 if wl:
                     _set_workload_role_labels(wl, env_val, app_val, role_val, dry_run)
