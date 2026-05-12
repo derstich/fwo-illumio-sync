@@ -746,6 +746,9 @@ MODELLING_PREFIX     = RS_PREFIX + "MODELLING_"  # legacy prefix (migrated away 
 # Matches <ENV>-<APP>-<ROLE>  e.g.  PR-WEBAPP-WEB  DR-DB-DATA
 ROLE_NAME_RE = re.compile(r'^([A-Z0-9]+)-([A-Z0-9]+)-([A-Z0-9]+)$')
 
+# Matches PCE_<key>_<value>  e.g.  PCE_env_PROD  PCE_app_APP13  PCE_role_WEB
+PCE_LABEL_GRP_RE = re.compile(r'^PCE_(env|app|role|bu|loc)_(.+)$')
+
 
 def _pce_delete_ruleset(href, name, dry_run):
     if dry_run:
@@ -925,6 +928,137 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
                                     f"{r.status_code} {r.text[:100]}")
 
 
+def sync_label_dim_groups(token, workloads, dry_run):
+    """Create/update PCE_<key>_<value> App Role groups in FWO Modelling.
+    Each group collects workloads sharing that label so users can pick e.g.
+    'all APP13 workloads' or 'all PROD workloads' in Modelling connections."""
+    log.info("── STEP 3d: PCE label dimensions → FWO Modelling groups ──────")
+    import subprocess
+
+    LABEL_DIM_KEYS = ("env", "app", "role")
+
+    def psql(sql):
+        r = subprocess.run(
+            ['sudo', '-u', 'postgres', 'psql', '-d', 'fworchdb', '-t', '-A', '-c', sql],
+            capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def esc(v):
+        return v.replace("'", "''")
+
+    # Collect (key, value) → set of IPs from labeled workloads
+    dim_to_ips: dict[tuple, set] = {}
+    for wl in workloads:
+        ip = primary_ip(wl)
+        if not ip:
+            continue
+        for lbl in wl.get("labels", []):
+            if lbl.get("key") in LABEL_DIM_KEYS and lbl.get("value"):
+                dim_to_ips.setdefault((lbl["key"], lbl["value"]), set()).add(ip)
+
+    if not dim_to_ips:
+        log.info("  No labeled workloads — nothing to create")
+        return
+
+    log.info(f"  {len(dim_to_ips)} label dimension(s) found")
+
+    for (key, value), ips in sorted(dim_to_ips.items()):
+        grp_name = f"PCE_{key}_{value}"
+
+        # Ensure nwgroup exists
+        existing_id = psql(
+            f"SELECT id FROM modelling.nwgroup "
+            f"WHERE name='{esc(grp_name)}' AND app_id=3 AND is_deleted=false LIMIT 1"
+        )
+        if existing_id:
+            grp_id = int(existing_id)
+        else:
+            if dry_run:
+                log.info(f"  [DRY] Would create nwgroup '{grp_name}'")
+                continue
+            new_id = psql(
+                f"INSERT INTO modelling.nwgroup "
+                f"(app_id, name, id_string, group_type, is_deleted, creator) "
+                f"VALUES (3, '{esc(grp_name)}', '{esc(grp_name)}', 20, false, 'pce_sync') "
+                f"RETURNING id"
+            )
+            if not new_id:
+                log.error(f"  Failed to create nwgroup '{grp_name}'")
+                continue
+            grp_id = int(new_id)
+            log.info(f"  Created  '{grp_name}' (id={grp_id})")
+
+        # Current member IPs from DB
+        rows = psql(
+            f"SELECT on2.ip FROM modelling.nwobject_nwgroup ong "
+            f"JOIN owner_network on2 ON on2.id = ong.nwobject_id "
+            f"WHERE ong.nwgroup_id = {grp_id}"
+        )
+        current_ips = {row.strip().split("/")[0] for row in rows.splitlines() if row.strip()}
+
+        added = removed_count = 0
+
+        # Add new members
+        for ip in ips - current_ips:
+            cidr = f"{ip}/32"
+            on_id = psql(
+                f"SELECT id FROM owner_network WHERE ip='{cidr}' AND is_deleted=false LIMIT 1"
+            )
+            if not on_id:
+                log.warning(f"    No owner_network entry for {ip} — skipped")
+                continue
+            if dry_run:
+                log.info(f"    [DRY] Would add {ip} to '{grp_name}'")
+                continue
+            psql(
+                f"INSERT INTO modelling.nwobject_nwgroup (nwobject_id, nwgroup_id) "
+                f"VALUES ({on_id}, {grp_id}) ON CONFLICT DO NOTHING"
+            )
+            added += 1
+
+        # Remove stale members (no longer carry this label)
+        for ip in current_ips - ips:
+            if ip == "0.0.0.0":
+                continue  # never remove placeholder
+            cidr = f"{ip}/32"
+            on_id = psql(f"SELECT id FROM owner_network WHERE ip='{cidr}' LIMIT 1")
+            if not on_id:
+                continue
+            if dry_run:
+                log.info(f"    [DRY] Would remove {ip} from '{grp_name}'")
+                continue
+            psql(
+                f"DELETE FROM modelling.nwobject_nwgroup "
+                f"WHERE nwobject_id={on_id} AND nwgroup_id={grp_id}"
+            )
+            removed_count += 1
+
+        action = "Updated" if added or removed_count else "OK"
+        log.info(f"  {action:<8} '{grp_name}' ({len(ips)} members"
+                 f"{f', +{added}' if added else ''}{f', -{removed_count}' if removed_count else ''})")
+
+    # Reconcile: soft-delete PCE_* dim groups whose label no longer exists on any workload
+    active_grp_names = {f"PCE_{k}_{v}" for (k, v) in dim_to_ips}
+    stale_rows = psql(
+        "SELECT id, name FROM modelling.nwgroup "
+        "WHERE app_id=3 AND group_type=20 AND is_deleted=false "
+        "AND name ~ '^PCE_(env|app|role|bu|loc)_'"
+    )
+    for line in stale_rows.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        gid, gname = parts[0].strip(), parts[1].strip()
+        if gname not in active_grp_names:
+            if dry_run:
+                log.info(f"  [DRY] Would soft-delete stale group '{gname}'")
+            else:
+                psql(f"UPDATE modelling.nwgroup SET is_deleted=true WHERE id={gid}")
+                log.info(f"  Soft-deleted stale group '{gname}'")
+
+
 def _actor_href(a):
     """Extract a stable string key from a PCE actor dict (label, label_group, or ip)."""
     if "label" in a:
@@ -1067,8 +1201,15 @@ def sync_export_modelling(token, dry_run):
                 actors.append({"actors": "ams"})
                 log.info(f"    '{grp_name}' → all workloads (ams)")
                 continue
+            pcl = PCE_LABEL_GRP_RE.match(grp_name)
             parsed = parse_role_name(grp_name)
-            if parsed:
+            if pcl:
+                lbl_key  = pcl.group(1)   # e.g. "app"
+                lbl_val  = pcl.group(2)   # e.g. "APP13"
+                lbl_href = pce_ensure_label(lbl_key, lbl_val, dry_run)
+                actors.append({"label": {"href": lbl_href}})
+                log.info(f"    '{grp_name}' → PCE label {lbl_key}={lbl_val}")
+            elif parsed:
                 env, app, role = parsed
                 app_href  = pce_ensure_label("app",  app,  dry_run)
                 role_href = pce_ensure_label("role", role, dry_run)
@@ -1249,6 +1390,7 @@ def main():
 
     if not args.import_only:
         sync_modelling_nwgroups(token, workloads, args.dry_run)
+        sync_label_dim_groups(token, workloads, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
     log.info("════════════════════════════════════════════════════════════")
