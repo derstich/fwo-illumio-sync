@@ -1,0 +1,16 @@
+[Unit]
+Description=FWO Modelling → PCE Sync Daemon
+Documentation=https://github.com/<your-org>/fwo-illumio-sync
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=postgres
+ExecStart=/usr/bin/python3 /usr/local/fworch/bin/fwo_sync_daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
