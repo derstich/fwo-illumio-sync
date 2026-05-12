@@ -24,7 +24,7 @@ Usage:
   python3 fwo_pce_sync.py [--import-only] [--export-only] [--dry-run] [--debug]
 """
 
-import sys, json, ipaddress, argparse, logging
+import sys, json, re, ipaddress, argparse, logging
 from datetime import datetime, timezone
 import requests
 from requests.auth import HTTPBasicAuth
@@ -35,9 +35,9 @@ FWO_GRAPHQL   = "https://localhost:9443/api/v1/graphql"
 FWO_AUTH_URL  = "http://localhost:8880/api/AuthenticationToken/Get"
 FWO_USER      = "admin"
 FWO_PASS      = "<fwo-admin-password>"
-FWO_MGM_ID    = 7   # Management ID of your Illumio device  (SELECT id, name FROM management;)
-FWO_DEV_ID    = 7   # Device ID of your Illumio PCE in FWO
-FWO_OWNER_ID  = 3   # owner_id in FWO Modelling             (SELECT id, name FROM owner;)
+FWO_MGM_ID    = 7   # Illumio_Demo
+FWO_DEV_ID    = 7   # Illumio_PCE device
+FWO_OWNER_ID  = 3   # Illumio_Demo_Owner (owner_network.owner_id)
 
 PCE_BASE      = "https://<pce-hostname>:8443/api/v2"
 PCE_ORG       = 1
@@ -125,6 +125,63 @@ def primary_ip(workload):
         return addr.split("/")[0]
 
     return None
+
+# ── Role-name helpers ───────────────────────────────────────────────────────────
+
+def parse_role_name(name):
+    """Return (env, app, role) if name matches <ENV>-<APP>-<ROLE>, else None."""
+    m = ROLE_NAME_RE.match((name or "").upper())
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+_label_cache = {}  # (key, value) → href
+
+
+def pce_ensure_label(key, value, dry_run):
+    """Find or create a PCE label for key=value. Returns its href."""
+    cache_key = (key, value)
+    if cache_key in _label_cache:
+        return _label_cache[cache_key]
+    existing = pce_get(f"/orgs/{PCE_ORG}/labels",
+                       {"key": key, "value": value, "max_results": 10})
+    if existing:
+        href = existing[0]["href"]
+    elif dry_run:
+        href = f"/orgs/{PCE_ORG}/labels/dry_{key}_{value}"
+    else:
+        result = pce_post(f"/orgs/{PCE_ORG}/labels", {"key": key, "value": value})
+        href = result["href"]
+        log.info(f"  Created PCE label {key}={value}: {href}")
+    _label_cache[cache_key] = href
+    return href
+
+
+def _set_workload_role_labels(wl, env_val, app_val, role_val, dry_run):
+    """Set env/app/role labels on a workload, preserving all other labels."""
+    env_href  = pce_ensure_label("env",  env_val,  dry_run)
+    app_href  = pce_ensure_label("app",  app_val,  dry_run)
+    role_href = pce_ensure_label("role", role_val, dry_run)
+
+    current = wl.get("labels", [])
+    cur_env  = next((l["href"] for l in current if l.get("key") == "env"),  None)
+    cur_app  = next((l["href"] for l in current if l.get("key") == "app"),  None)
+    cur_role = next((l["href"] for l in current if l.get("key") == "role"), None)
+    if cur_env == env_href and cur_app == app_href and cur_role == role_href:
+        return  # already correct
+
+    new_labels = [l for l in current if l.get("key") not in ("env", "app", "role")]
+    new_labels += [{"href": env_href,  "key": "env",  "value": env_val},
+                   {"href": app_href,  "key": "app",  "value": app_val},
+                   {"href": role_href, "key": "role", "value": role_val}]
+
+    hostname = wl.get("hostname") or primary_ip(wl)
+    if dry_run:
+        log.info(f"    [DRY] Would set env={env_val}/app={app_val}/role={role_val} on {hostname}")
+    else:
+        pce_put(wl["href"], {"labels": [{"href": l["href"]} for l in new_labels]})
+        log.info(f"    Set env={env_val}/app={app_val}/role={role_val} on {hostname}")
+    wl["labels"] = new_labels  # update in-memory for subsequent operations
+
 
 # ── FWO helpers ─────────────────────────────────────────────────────────────────
 
@@ -654,6 +711,9 @@ def sync_export(token, dry_run):
 
 MODELLING_PREFIX = RS_PREFIX + "MODELLING_"
 
+# Matches <ENV>-<APP>-<ROLE>  e.g.  PR-WEBAPP-WEB  DR-DB-DATA
+ROLE_NAME_RE = re.compile(r'^([A-Z0-9]+)-([A-Z0-9]+)-([A-Z0-9]+)$')
+
 
 def _pce_delete_ruleset(href, name, dry_run):
     if dry_run:
@@ -664,8 +724,9 @@ def _pce_delete_ruleset(href, name, dry_run):
         log.info(f"  Deleted PCE ruleset '{name}'")
 
 
-def sync_modelling_nwgroups(token, dry_run):
-    """Sync FWO modelling.nwgroup entries → PCE label groups (key=ar)."""
+def sync_modelling_nwgroups(token, workloads, dry_run):
+    """Sync FWO modelling.nwgroup entries → PCE label groups (key=ar).
+    Groups matching <ENV>-<APP>-<ROLE> also set env/app/role labels on member workloads."""
     log.info("── STEP 3b: FWO Modelling nwgroups → PCE label groups ───────")
 
     data = fwo_gql(token, """query {
@@ -680,6 +741,9 @@ def sync_modelling_nwgroups(token, dry_run):
     groups = [g for g in all_groups if not g["is_deleted"]]
     # All names ever known to FWO (active + deleted) — safe reconciliation boundary
     all_fwo_names = {g["name"] for g in all_groups}
+
+    # Build IP → workload lookup for label assignment
+    wl_by_ip = {primary_ip(wl): wl for wl in workloads if primary_ip(wl)}
 
     # Fetch current PCE ar-labels to map WL-name → label href
     all_labels = pce_get(f"/orgs/{PCE_ORG}/labels", {"max_results": 1000, "key": PCE_AR_KEY})
@@ -705,6 +769,19 @@ def sync_modelling_nwgroups(token, dry_run):
         if not label_hrefs:
             log.info(f"  Skip '{grp_name}' — no resolvable members")
             continue
+
+        # Named groups: set env/app/role labels on member workloads
+        parsed = parse_role_name(grp_name)
+        if parsed:
+            env_val, app_val, role_val = parsed
+            log.info(f"  Named role '{grp_name}' → env={env_val}, app={app_val}, role={role_val}")
+            for entry in grp["nwobject_nwgroups"]:
+                ip = str(entry["owner_network"]["ip"]).split("/")[0]
+                wl = wl_by_ip.get(ip)
+                if wl:
+                    _set_workload_role_labels(wl, env_val, app_val, role_val, dry_run)
+                else:
+                    log.warning(f"    No workload found for IP {ip}")
 
         if grp_name in pce_groups_by_name:
             existing = pce_groups_by_name[grp_name]
@@ -841,18 +918,31 @@ def sync_export_modelling(token, dry_run):
             return pce_svc_by_port.get((port, proto))
         return None
 
-    def _actors(nwobjects, approles):
+    def _actors_with_env(nwobjects, approles):
+        """Return (actors, env_value_or_None).
+        Named roles (<ENV>-<APP>-<ROLE>) → label-based actors + env for scope.
+        Other roles → ar-label-group actor (backward compat)."""
         actors = []
+        env_val = None
         for entry in approles:
             grp_name = entry["nwgroup"]["name"]
-            if grp_name in pce_groups_by_name:
+            parsed = parse_role_name(grp_name)
+            if parsed:
+                env, app, role = parsed
+                app_href  = pce_ensure_label("app",  app,  dry_run)
+                role_href = pce_ensure_label("role", role, dry_run)
+                actors += [{"label": {"href": app_href}},
+                           {"label": {"href": role_href}}]
+                env_val = env
+                log.info(f"    Role '{grp_name}' → label actors app={app}, role={role}")
+            elif grp_name in pce_groups_by_name:
                 actors.append({"label_group": {"href": pce_groups_by_name[grp_name]["href"]}})
             else:
                 log.warning(f"    PCE label group '{grp_name}' not found — skipped")
         for entry in nwobjects:
             ip = str(entry["owner_network"]["ip"]).split("/")[0]
             actors.append({"actors": ip})
-        return actors or [{"actors": "ams"}]
+        return actors or [{"actors": "ams"}], env_val
 
     def _ingress(svc_connections):
         result = []
@@ -891,18 +981,28 @@ def sync_export_modelling(token, dry_run):
     # Upsert active connections
     for conn in active:
         rs_name = MODELLING_PREFIX + (conn["name"] or f"conn_{conn['id']}")
-        consumers = _actors(conn["source_nwobjects"], conn["source_approles"])
-        providers = _actors(conn["dest_nwobjects"],   conn["dest_approles"])
+        consumers, src_env = _actors_with_env(conn["source_nwobjects"], conn["source_approles"])
+        providers, dst_env = _actors_with_env(conn["dest_nwobjects"],   conn["dest_approles"])
         ingress   = _ingress(conn["service_connections"])
+
+        # Scope: if both sides are named roles sharing the same env, scope to that env
+        if src_env and dst_env and src_env == dst_env:
+            env_href = pce_ensure_label("env", src_env, dry_run)
+            scopes   = [[{"label": {"href": env_href}}]]
+            unscoped = False
+            log.info(f"    Scoped ruleset: env={src_env}")
+        else:
+            scopes   = [[]]
+            unscoped = True
 
         rs_body = {
             "name":        rs_name,
             "enabled":     True,
             "description": conn.get("reason") or "Created by FWO Modelling sync",
-            "scopes":      [[]],
+            "scopes":      scopes,
             "rules": [{
                 "enabled":            True,
-                "unscoped_consumers": True,
+                "unscoped_consumers": unscoped,
                 "resolve_labels_as":  {"consumers": ["workloads"], "providers": ["workloads"]},
                 "consumers":          consumers,
                 "providers":          providers,
@@ -963,7 +1063,7 @@ def main():
         sync_import(token, workloads, wl_to_ar, args.dry_run)
 
     if not args.import_only:
-        sync_modelling_nwgroups(token, args.dry_run)
+        sync_modelling_nwgroups(token, workloads, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
     log.info("════════════════════════════════════════════════════════════")

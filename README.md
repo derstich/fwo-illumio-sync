@@ -182,6 +182,54 @@ sudo python3 /usr/local/fworch/bin/fwo_pce_sync.py
 
 ---
 
+## Label-Based Policy (Recommended)
+
+App Roles in FWO Modelling can follow the `<ENV>-<APP>-<ROLE>` naming convention to automatically drive PCE label assignment and produce scoped, label-based rulesets — the native Illumio approach.
+
+### Naming Convention
+
+```
+PR-WEBAPP-WEB     →  env=PR,  app=WEBAPP,  role=WEB
+DR-DB-DATA        →  env=DR,  app=DB,      role=DATA
+PROD-API-BACKEND  →  env=PROD, app=API,    role=BACKEND
+```
+
+- Segments are uppercase alphanumeric, separated by `-`
+- At least one character per segment
+- Exactly 3 segments: Environment · Application · Role
+
+### What the sync does for named App Roles
+
+1. **Parses the name** into `(env, app, role)` components
+2. **Creates PCE labels** `env=<ENV>`, `app=<APP>`, `role=<ROLE>` if they don't exist
+3. **Sets those labels on member workloads** — workloads assigned to `PR-WEBAPP-WEB` receive `env=PR`, `app=WEBAPP`, `role=WEB` (existing `ar`, `bu`, `loc` labels are preserved)
+4. **Connections between named roles produce scoped rulesets**:
+   - If source and destination share the same `env` → ruleset scope `[[env=<ENV>]]`, consumers not unscoped
+   - Otherwise → global scope `[[]]`
+   - Actors are PCE label refs (`app=…`, `role=…`) — not ar-label-groups
+
+### Example
+
+FWO Modelling connection `PR-WEBAPP-WEB → PR-DB-DATA` produces:
+
+```json
+{
+  "name": "FWO_MODELLING_WEB-TO-DB",
+  "scopes": [[{"label": {"href": "/orgs/1/labels/<env-PR>"}}]],
+  "rules": [{
+    "consumers":        [{"label": app=WEBAPP}, {"label": role=WEB}],
+    "providers":        [{"label": app=DB},     {"label": role=DATA}],
+    "unscoped_consumers": false
+  }]
+}
+```
+
+### Backward Compatibility
+
+App Roles whose names do **not** match the `<ENV>-<APP>-<ROLE>` pattern (e.g. `AR9904567-001`) continue to use the existing ar-label-group approach unchanged. Both styles can coexist in the same FWO Modelling application.
+
+---
+
 ## FWO Modelling Setup
 
 After the initial import, the following FWO Modelling objects are needed:
