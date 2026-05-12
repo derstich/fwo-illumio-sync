@@ -225,7 +225,7 @@ def fwo_token():
     r.raise_for_status()
     return r.text.strip()
 
-def fwo_gql(token, query, variables=None):
+def fwo_gql(token, query, variables=None, allow_errors=False):
     r = requests.post(FWO_GRAPHQL,
                       headers={"Authorization": f"Bearer {token}",
                                "Content-Type": "application/json"},
@@ -234,6 +234,9 @@ def fwo_gql(token, query, variables=None):
     r.raise_for_status()
     d = r.json()
     if "errors" in d:
+        if allow_errors:
+            log.debug(f"GraphQL error (non-fatal): {d['errors']}")
+            return None
         raise RuntimeError(f"GraphQL error: {d['errors']}")
     return d["data"]
 
@@ -958,22 +961,23 @@ def sync_label_dim_groups(token, workloads, dry_run):
 
     log.info(f"  {len(dim_to_ips)} dimension(s) found across {len(ip_to_labels)} workloads")
 
-    # Load owner_network entries (IP → id) from FWO via GraphQL
-    on_data = fwo_gql(token, """query($owner: Int!) {
-      owner_network(where: {owner_id: {_eq: $owner}, is_deleted: {_eq: false}, nw_type: {_eq: 10}}) {
-        id ip
-      }
-    }""", {"owner": FWO_OWNER_ID})
-    on_by_ip = {str(r["ip"]).split("/")[0]: r["id"] for r in on_data.get("owner_network", [])}
-
-    # Load existing modelling App Role groups
+    # Load existing modelling App Role groups WITH their owner_network members.
+    # owner_network is not a top-level GraphQL query in FWO — access via nested relation only.
     gdata = fwo_gql(token, """query {
       modelling_nwgroup(where: {app_id: {_eq: 3}, group_type: {_eq: 20}, is_deleted: {_eq: false}}) {
         id name
-        nwobject_nwgroups { nwobject_id }
+        nwobject_nwgroups { nwobject_id owner_network { id ip } }
       }
     }""")
     existing_groups = {g["name"]: g for g in gdata.get("modelling_nwgroup", [])}
+
+    # Build IP → owner_network id from all already-known group members
+    on_by_ip: dict[str, int] = {}
+    for grp in existing_groups.values():
+        for entry in grp.get("nwobject_nwgroups", []):
+            on = entry.get("owner_network") or {}
+            if on.get("id") and on.get("ip"):
+                on_by_ip[str(on["ip"]).split("/")[0]] = on["id"]
 
     for (key, value), ips in sorted(dim_to_ips.items()):
         grp_name    = f"PCE_{key}_{value}"
@@ -995,7 +999,11 @@ def sync_label_dim_groups(token, workloads, dry_run):
                 app_id: 3, name: $name, id_string: $name,
                 group_type: 20, is_deleted: false, creator: "pce_sync"
               }) { id }
-            }""", {"name": grp_name})
+            }""", {"name": grp_name}, allow_errors=True)
+            if not result:
+                log.error(f"  FAILED to create '{grp_name}' — Hasura mutation not permitted. "
+                          f"Run sql/initial_objects.sql or create the group manually in FWO Modelling.")
+                continue
             grp_id      = result["insert_modelling_nwgroup_one"]["id"]
             current_ids = set()
             log.info(f"  Created  '{grp_name}' (id={grp_id})")
@@ -1011,11 +1019,15 @@ def sync_label_dim_groups(token, workloads, dry_run):
                 where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}) { nwobject_id }
             }""", {"nw": on_id, "grp": grp_id})
             if not chk.get("modelling_nwobject_nwgroup"):
-                fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
+                r2 = fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
                   insert_modelling_nwobject_nwgroup_one(object: {
                     nwobject_id: $nw, nwgroup_id: $grp
                   }) { nwobject_id }
-                }""", {"nw": on_id, "grp": grp_id})
+                }""", {"nw": on_id, "grp": grp_id}, allow_errors=True)
+                if not r2:
+                    log.error(f"    FAILED to add member on_id={on_id} to '{grp_name}' — "
+                              f"Hasura mutation not permitted.")
+                    continue
             added += 1
 
         for on_id in current_ids - desired_ids:
@@ -1026,7 +1038,7 @@ def sync_label_dim_groups(token, workloads, dry_run):
               delete_modelling_nwobject_nwgroup(
                 where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}
               ) { affected_rows }
-            }""", {"nw": on_id, "grp": grp_id})
+            }""", {"nw": on_id, "grp": grp_id}, allow_errors=True)
             removed += 1
 
         action = "Updated" if added or removed else "OK"
@@ -1044,7 +1056,7 @@ def sync_label_dim_groups(token, workloads, dry_run):
                   update_modelling_nwgroup_by_pk(
                     pk_columns: {id: $id}, _set: {is_deleted: true}
                   ) { id }
-                }""", {"id": grp["id"]})
+                }""", {"id": grp["id"]}, allow_errors=True)
                 log.info(f"  Soft-deleted stale group '{name}'")
 
 
