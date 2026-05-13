@@ -929,7 +929,7 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
 
 
 def sync_dim_groups(token, named_groups, dry_run):
-    """Derive PCE_env_X / PCE_app_X / PCE_role_X App Role groups in FWO Modelling
+    """Derive env:X / app:X / role:X App Role groups in FWO Modelling
     from Named Role groups already loaded.  All data comes from FWO — no PCE calls.
     Writes via psql (same as fwo_upsert_owner_network already does)."""
     log.info("── STEP 3c: Named role components → FWO Modelling dim groups ──")
@@ -966,10 +966,10 @@ def sync_dim_groups(token, named_groups, dry_run):
 
     # Existing dim groups from already-loaded list
     existing_dim = {grp["name"]: grp for grp in named_groups
-                    if re.match(r'^PCE_(env|app|role)_', grp["name"])}
+                    if re.match(r'^(env|app|role):', grp["name"])}
 
     for (key, value), desired_ids in sorted(dim_to_on_ids.items()):
-        grp_name = f"PCE_{key}_{value}"
+        grp_name = f"{key}:{value}"
         esc_name = grp_name.replace("'", "''")
 
         if grp_name in existing_dim:
@@ -1018,8 +1018,18 @@ def sync_dim_groups(token, named_groups, dry_run):
         log.info(f"  {action:<8} '{grp_name}' ({len(desired_ids)} members"
                  f"{f', +{added}' if added else ''}{f', -{removed}' if removed else ''})")
 
+    # Migrate legacy PCE_env_X / PCE_app_X / PCE_role_X groups → soft-delete
+    legacy_dim = {grp["name"]: grp for grp in named_groups
+                  if re.match(r'^PCE_(env|app|role)_', grp["name"])}
+    for name, grp in legacy_dim.items():
+        if dry_run:
+            log.info(f"  [DRY] Would soft-delete legacy group '{name}'")
+        else:
+            psql(f"UPDATE modelling.nwgroup SET is_deleted=true WHERE id={grp['id']}")
+            log.info(f"  Soft-deleted legacy group '{name}'")
+
     # Soft-delete dim groups no longer derivable from any named role
-    active = {f"PCE_{k}_{v}" for (k, v) in dim_to_on_ids}
+    active = {f"{k}:{v}" for (k, v) in dim_to_on_ids}
     for name, grp in existing_dim.items():
         if name not in active:
             if dry_run:
