@@ -765,7 +765,7 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
       modelling_nwgroup(where: {app_id: {_eq: 3}, group_type: {_eq: 20}}) {
         id name is_deleted
         nwobject_nwgroups {
-          owner_network { name ip }
+          owner_network { id name ip }
         }
       }
     }""", {})
@@ -924,7 +924,114 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
                         log.warning(f"  Delete label {key}={lbl['value']}: "
                                     f"{r.status_code} {r.text[:100]}")
 
+    return groups  # pass to sync_dim_groups
 
+
+
+def sync_dim_groups(token, named_groups, dry_run):
+    """Derive PCE_env_X / PCE_app_X / PCE_role_X App Role groups in FWO Modelling
+    from Named Role groups already loaded.  All data comes from FWO — no PCE calls."""
+    log.info("── STEP 3c: Named role components → FWO Modelling dim groups ──")
+
+    # Build dim → set of owner_network ids from named role member lists
+    dim_to_on_ids: dict[tuple, set] = {}
+    for grp in named_groups:
+        parsed = parse_role_name(grp["name"])
+        if not parsed:
+            continue
+        env, app, role = parsed
+        for entry in grp.get("nwobject_nwgroups", []):
+            on = entry.get("owner_network", {})
+            on_id = on.get("id")
+            ip    = str(on.get("ip", "")).split("/")[0]
+            if not on_id or ip == "0.0.0.0":
+                continue
+            dim_to_on_ids.setdefault(("env",  env),  set()).add(on_id)
+            dim_to_on_ids.setdefault(("app",  app),  set()).add(on_id)
+            dim_to_on_ids.setdefault(("role", role), set()).add(on_id)
+
+    if not dim_to_on_ids:
+        log.info("  No named role members found — nothing to create")
+        return
+
+    # Load existing dim groups (PCE_* pattern) — reuse the already-loaded group list
+    existing_dim = {grp["name"]: grp for grp in named_groups
+                    if re.match(r'^PCE_(env|app|role)_', grp["name"])}
+
+    for (key, value), desired_ids in sorted(dim_to_on_ids.items()):
+        grp_name = f"PCE_{key}_{value}"
+
+        if grp_name in existing_dim:
+            grp         = existing_dim[grp_name]
+            grp_id      = grp["id"]
+            current_ids = {e["owner_network"]["id"]
+                           for e in grp.get("nwobject_nwgroups", [])
+                           if e.get("owner_network", {}).get("id")}
+        else:
+            if dry_run:
+                log.info(f"  [DRY] Would create nwgroup '{grp_name}'")
+                continue
+            try:
+                result = fwo_gql(token, """mutation($name: String!) {
+                  insert_modelling_nwgroup_one(object: {
+                    app_id: 3, name: $name, id_string: $name,
+                    group_type: 20, is_deleted: false, creator: "pce_sync"
+                  }) { id }
+                }""", {"name": grp_name})
+                grp_id      = result["insert_modelling_nwgroup_one"]["id"]
+                current_ids = set()
+                log.info(f"  Created  '{grp_name}' (id={grp_id})")
+            except RuntimeError as e:
+                log.error(f"  Cannot create '{grp_name}': {e}")
+                continue
+
+        added = removed = 0
+
+        for on_id in desired_ids - current_ids:
+            if dry_run:
+                log.info(f"    [DRY] Would add on_id={on_id} to '{grp_name}'")
+                continue
+            try:
+                fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
+                  insert_modelling_nwobject_nwgroup_one(object: {
+                    nwobject_id: $nw, nwgroup_id: $grp
+                  }) { nwobject_id }
+                }""", {"nw": on_id, "grp": grp_id})
+                added += 1
+            except RuntimeError:
+                pass  # duplicate — already member
+
+        for on_id in current_ids - desired_ids:
+            if dry_run:
+                log.info(f"    [DRY] Would remove on_id={on_id} from '{grp_name}'")
+                continue
+            fwo_gql(token, """mutation($nw: bigint!, $grp: bigint!) {
+              delete_modelling_nwobject_nwgroup(
+                where: {nwobject_id: {_eq: $nw}, nwgroup_id: {_eq: $grp}}
+              ) { affected_rows }
+            }""", {"nw": on_id, "grp": grp_id})
+            removed += 1
+
+        action = "Updated" if added or removed else "OK"
+        log.info(f"  {action:<8} '{grp_name}' ({len(desired_ids)} members"
+                 f"{f', +{added}' if added else ''}{f', -{removed}' if removed else ''})")
+
+    # Soft-delete dim groups no longer derivable from any named role
+    active = {f"PCE_{k}_{v}" for (k, v) in dim_to_on_ids}
+    for name, grp in existing_dim.items():
+        if name not in active:
+            if dry_run:
+                log.info(f"  [DRY] Would soft-delete stale group '{name}'")
+            else:
+                try:
+                    fwo_gql(token, """mutation($id: bigint!) {
+                      update_modelling_nwgroup_by_pk(
+                        pk_columns: {id: $id}, _set: {is_deleted: true}
+                      ) { id }
+                    }""", {"id": grp["id"]})
+                    log.info(f"  Soft-deleted stale group '{name}'")
+                except RuntimeError as e:
+                    log.error(f"  Cannot soft-delete '{name}': {e}")
 
 
 def _actor_href(a):
@@ -1250,7 +1357,8 @@ def main():
         sync_import(token, workloads, wl_to_ar, args.dry_run)
 
     if not args.import_only:
-        sync_modelling_nwgroups(token, workloads, args.dry_run)
+        named_groups = sync_modelling_nwgroups(token, workloads, args.dry_run)
+        sync_dim_groups(token, named_groups, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
     log.info("════════════════════════════════════════════════════════════")
