@@ -765,7 +765,7 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
       modelling_nwgroup(where: {app_id: {_eq: 3}, group_type: {_eq: 20}}) {
         id name is_deleted
         nwobject_nwgroups {
-          owner_network { id name ip }
+          owner_network { name ip }
         }
       }
     }""", {})
@@ -924,119 +924,6 @@ def sync_modelling_nwgroups(token, workloads, dry_run):
                         log.warning(f"  Delete label {key}={lbl['value']}: "
                                     f"{r.status_code} {r.text[:100]}")
 
-    return groups  # pass to sync_dim_groups
-
-
-
-def sync_dim_groups(token, named_groups, dry_run):
-    """Derive env:X / app:X / role:X App Role groups in FWO Modelling
-    from Named Role groups already loaded.  All data comes from FWO — no PCE calls.
-    Writes via psql (same as fwo_upsert_owner_network already does)."""
-    log.info("── STEP 3c: Named role components → FWO Modelling dim groups ──")
-    import subprocess
-
-    def psql(sql):
-        r = subprocess.run(
-            ['sudo', '-u', 'postgres', 'psql', '-d', 'fworchdb', '-t', '-A', '-c', sql],
-            capture_output=True, text=True)
-        return r.stdout.strip()
-
-    # Build dim → set of owner_network ids from named role member lists
-    dim_to_on_ids: dict[tuple, set] = {}
-    for grp in named_groups:
-        parsed = parse_role_name(grp["name"])
-        if not parsed:
-            continue
-        env, app, role = parsed
-        for entry in grp.get("nwobject_nwgroups", []):
-            on    = entry.get("owner_network", {})
-            on_id = on.get("id")
-            ip    = str(on.get("ip", "")).split("/")[0]
-            if not on_id or ip == "0.0.0.0":
-                continue
-            dim_to_on_ids.setdefault(("env",  env),  set()).add(on_id)
-            dim_to_on_ids.setdefault(("app",  app),  set()).add(on_id)
-            dim_to_on_ids.setdefault(("role", role), set()).add(on_id)
-
-    if not dim_to_on_ids:
-        log.info("  No named role members found — nothing to create")
-        return
-
-    log.info(f"  {len(dim_to_on_ids)} dimension(s) to sync")
-
-    # Existing dim groups from already-loaded list
-    existing_dim = {grp["name"]: grp for grp in named_groups
-                    if re.match(r'^(env|app|role):', grp["name"])}
-
-    for (key, value), desired_ids in sorted(dim_to_on_ids.items()):
-        grp_name = f"{key}:{value}"
-        esc_name = grp_name.replace("'", "''")
-
-        if grp_name in existing_dim:
-            grp         = existing_dim[grp_name]
-            grp_id      = grp["id"]
-            current_ids = {e["owner_network"]["id"]
-                           for e in grp.get("nwobject_nwgroups", [])
-                           if e.get("owner_network", {}).get("id")}
-        else:
-            if dry_run:
-                log.info(f"  [DRY] Would create nwgroup '{grp_name}'")
-                continue
-            new_id = psql(
-                f"INSERT INTO modelling.nwgroup "
-                f"(app_id, name, id_string, group_type, is_deleted, creator) "
-                f"VALUES (3, '{esc_name}', '{esc_name}', 20, false, 'pce_sync') "
-                f"RETURNING id"
-            )
-            new_id = new_id.splitlines()[0].strip() if new_id else ""
-            if not new_id:
-                log.error(f"  Failed to create nwgroup '{grp_name}'")
-                continue
-            grp_id      = int(new_id)
-            current_ids = set()
-            log.info(f"  Created  '{grp_name}' (id={grp_id})")
-
-        added = removed = 0
-
-        for on_id in desired_ids - current_ids:
-            if dry_run:
-                log.info(f"    [DRY] Would add on_id={on_id} to '{grp_name}'")
-                continue
-            psql(f"INSERT INTO modelling.nwobject_nwgroup (nwobject_id, nwgroup_id) "
-                 f"VALUES ({on_id}, {grp_id}) ON CONFLICT DO NOTHING")
-            added += 1
-
-        for on_id in current_ids - desired_ids:
-            if dry_run:
-                log.info(f"    [DRY] Would remove on_id={on_id} from '{grp_name}'")
-                continue
-            psql(f"DELETE FROM modelling.nwobject_nwgroup "
-                 f"WHERE nwobject_id={on_id} AND nwgroup_id={grp_id}")
-            removed += 1
-
-        action = "Updated" if added or removed else "OK"
-        log.info(f"  {action:<8} '{grp_name}' ({len(desired_ids)} members"
-                 f"{f', +{added}' if added else ''}{f', -{removed}' if removed else ''})")
-
-    # Migrate legacy PCE_env_X / PCE_app_X / PCE_role_X groups → soft-delete
-    legacy_dim = {grp["name"]: grp for grp in named_groups
-                  if re.match(r'^PCE_(env|app|role)_', grp["name"])}
-    for name, grp in legacy_dim.items():
-        if dry_run:
-            log.info(f"  [DRY] Would soft-delete legacy group '{name}'")
-        else:
-            psql(f"UPDATE modelling.nwgroup SET is_deleted=true WHERE id={grp['id']}")
-            log.info(f"  Soft-deleted legacy group '{name}'")
-
-    # Soft-delete dim groups no longer derivable from any named role
-    active = {f"{k}:{v}" for (k, v) in dim_to_on_ids}
-    for name, grp in existing_dim.items():
-        if name not in active:
-            if dry_run:
-                log.info(f"  [DRY] Would soft-delete stale group '{name}'")
-            else:
-                psql(f"UPDATE modelling.nwgroup SET is_deleted=true WHERE id={grp['id']}")
-                log.info(f"  Soft-deleted stale group '{name}'")
 
 
 def _actor_href(a):
@@ -1362,8 +1249,7 @@ def main():
         sync_import(token, workloads, wl_to_ar, args.dry_run)
 
     if not args.import_only:
-        named_groups = sync_modelling_nwgroups(token, workloads, args.dry_run)
-        sync_dim_groups(token, named_groups, args.dry_run)
+        sync_modelling_nwgroups(token, workloads, args.dry_run)
         sync_export_modelling(token, args.dry_run)
 
     log.info("════════════════════════════════════════════════════════════")
