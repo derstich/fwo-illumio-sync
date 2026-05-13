@@ -988,6 +988,7 @@ def sync_dim_groups(token, named_groups, dry_run):
                 f"VALUES (3, '{esc_name}', '{esc_name}', 20, false, 'pce_sync') "
                 f"RETURNING id"
             )
+            new_id = new_id.splitlines()[0].strip() if new_id else ""
             if not new_id:
                 log.error(f"  Failed to create nwgroup '{grp_name}'")
                 continue
